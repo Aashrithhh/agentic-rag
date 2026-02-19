@@ -1,0 +1,32 @@
+From    : Mark Anderson [manderson@purviewexchange.com]
+Sent    : 4/02/2024 3:45:00 PM
+To      : Sarah Johnson [sjohnson@purviewexchange.com]
+CC      : David Williams [dwilliams@purviewexchange.com]; Legal Team [legal@purviewexchange.com]
+Subject : Fwd: Suspicious Wire Transfer Requests - Potential BEC Fraud
+
+Sarah, David,
+
+I'm escalating a concerning pattern we've identified in the Purview Exchange email archives during our routine compliance review.
+
+Between January and March 2024, we found 7 wire transfer requests that originated from email addresses spoofing C-suite executives. Three of these were flagged by our finance team before execution, but FOUR wire transfers totaling $1.2 million were processed before the fraud was detected.
+
+Details of the fraudulent transfers:
+1. Jan 12 — $180,000 to "Vendor Solutions LLC" (spoofed CEO email) - EXECUTED
+2. Jan 28 — $350,000 to "Pacific Trading Corp" (spoofed CFO email) - EXECUTED
+3. Feb 14 — $95,000 to "Global Consulting Partners" (spoofed CEO email) - BLOCKED
+4. Feb 22 — $420,000 to "Eastern Supply Chain Ltd" (spoofed CFO email) - EXECUTED
+5. Mar 01 — $275,000 to "Premier Advisory Services" (spoofed COO email) - BLOCKED
+6. Mar 08 — $250,000 to "Apex Digital Solutions" (spoofed CEO email) - EXECUTED
+7. Mar 15 — $180,000 to "Northern Capital Group" (spoofed CFO email) - BLOCKED
+
+Analysis of the email headers shows the spoofed messages bypassed our SPF/DKIM checks because the attacker used a lookalike domain (purviewexchagne.com — note the transposed letters). This domain was registered just 3 days before the first fraudulent email.
+
+I recommend:
+1. Immediate DMARC enforcement (currently in monitor-only mode)
+2. Verbal confirmation requirement for all wire transfers over $50,000
+3. Engagement of forensic accountants to trace the $1.2M in fraudulent transfers
+4. Filing an IC3 complaint with the FBI
+
+Mark Anderson
+Director of Internal Audit
+Purview Exchange Corporation

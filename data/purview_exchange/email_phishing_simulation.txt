@@ -1,0 +1,37 @@
+From    : David Williams [dwilliams@purviewexchange.com]
+Sent    : 2/22/2024 10:30:00 AM
+To      : All Employees [allstaff@purviewexchange.com]
+CC      : HR Department [hr@purviewexchange.com]
+Subject : Phishing Simulation Results - Q1 2024
+
+All,
+
+I wanted to share the results of our most recent phishing simulation campaign conducted on February 15-16, 2024.
+
+CAMPAIGN SUMMARY:
+- Total emails sent: 2,847
+- Emails opened: 2,134 (74.9%)
+- Links clicked: 412 (14.5%)
+- Credentials submitted: 89 (3.1%)
+- Reports to IT Security: 623 (21.9%)
+
+While our click rate has improved from 22.3% in Q3 2023, the credential submission rate remains concerning. 89 employees entered their actual credentials on the simulated phishing page. This is particularly alarming given the recent actual security breach.
+
+DEPARTMENT BREAKDOWN:
+- Finance: 18.2% click rate (HIGHEST — mandatory retraining required)
+- Sales: 16.7% click rate
+- Marketing: 15.1% click rate
+- Engineering: 8.4% click rate (LOWEST)
+- Legal: 11.2% click rate
+
+ACTION ITEMS:
+1. All employees who submitted credentials will undergo mandatory security awareness training by March 15
+2. Finance department will receive enhanced phishing training given their high click rate and the recent compromised accounts
+3. We are implementing a new "Report Phishing" button in Outlook to make reporting easier
+4. Starting Q2, employees who fail two consecutive phishing simulations will have their email access restricted to web-only (no mobile sync)
+
+The next simulation is scheduled for Q2 2024. Please review the attached security awareness materials.
+
+David Williams
+Chief Information Security Officer
+Purview Exchange Corporation

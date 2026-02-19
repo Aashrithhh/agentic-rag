@@ -1,0 +1,31 @@
+From    : David Williams [dwilliams@purviewexchange.com]
+Sent    : 3/15/2024 9:22:14 AM
+To      : IT Security Team [itsecurity@purviewexchange.com]
+CC      : Sarah Johnson [sjohnson@purviewexchange.com]
+Subject : Urgent: Security Breach Notification - March 2024
+
+Team,
+
+I am writing to inform you of a security incident that was detected on our Exchange servers last night at approximately 11:47 PM EST. Our monitoring systems flagged unusual outbound traffic from the mail relay cluster (EX-NODE-04 and EX-NODE-07).
+
+Preliminary analysis indicates that an unauthorized actor gained access to several mailboxes in the Finance department through a compromised service account. The affected accounts include:
+
+- jmartin@purviewexchange.com (Jennifer Martin, CFO)
+- rthompson@purviewexchange.com (Robert Thompson, Controller)
+- mchen@purviewexchange.com (Michelle Chen, Accounts Payable)
+
+The attacker appears to have used a credential stuffing technique, exploiting a service account (svc-backup-mail) that had not been rotated since Q3 2023 in violation of our password rotation policy.
+
+Immediate actions taken:
+1. Disabled the compromised service account
+2. Forced password reset on all affected mailboxes
+3. Enabled enhanced logging on all Exchange nodes
+4. Notified our incident response vendor (CrowdStrike)
+
+We need to conduct a full forensic review of the mail flow logs for the past 30 days. I've also flagged this to Legal as we may have GDPR and SOX notification obligations.
+
+Please treat this as Priority 1. I need the full incident timeline by EOD tomorrow.
+
+David Williams
+Chief Information Security Officer
+Purview Exchange Corporation

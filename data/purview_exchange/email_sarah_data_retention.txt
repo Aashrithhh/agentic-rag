@@ -1,0 +1,42 @@
+From    : Sarah Johnson [sjohnson@purviewexchange.com]
+Sent    : 1/10/2024 11:00:00 AM
+To      : IT Operations [itops@purviewexchange.com]
+CC      : Legal Team [legal@purviewexchange.com]; David Williams [dwilliams@purviewexchange.com]
+Subject : Updated Data Retention Policy for Exchange Archives
+
+Team,
+
+Following the Board's approval of the updated Information Governance Framework, I am issuing new data retention guidelines for all Purview Exchange email archives effective February 1, 2024.
+
+KEY CHANGES:
+
+1. RETENTION PERIODS:
+   - Executive communications (C-suite): 10 years (increased from 7)
+   - Financial/accounting emails: 7 years (SOX requirement)
+   - Legal hold emails: Indefinite until hold is released
+   - General business correspondence: 3 years
+   - Marketing/promotional: 1 year
+   - Personal/non-business: 90 days
+
+2. LITIGATION HOLD PROCEDURES:
+   - All litigation hold notices must be processed within 4 hours of receipt
+   - IT must preserve ALL mailbox data for custodians named in a hold
+   - Journaling must be enabled for all custodian mailboxes immediately
+   - No PST files may be deleted while a litigation hold is active
+
+3. PST EXPORT CONTROLS:
+   - PST exports require manager + compliance approval
+   - All PST files must be encrypted with AES-256
+   - PST files must be logged in the chain-of-custody system
+   - External transfer of PST files requires Legal sign-off
+
+4. PURVIEW COMPLIANCE INTEGRATION:
+   - We are migrating all Exchange compliance features to Microsoft Purview
+   - eDiscovery searches will now be conducted through Purview Compliance Center
+   - All sensitivity labels must be applied per the updated classification guide
+
+Please ensure your teams are briefed on these changes before the February 1 effective date. Non-compliance will be treated as a policy violation subject to disciplinary action.
+
+Sarah Johnson
+VP of Compliance
+Purview Exchange Corporation

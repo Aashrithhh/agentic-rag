@@ -1,0 +1,23 @@
+From    : Sarah Johnson [sjohnson@purviewexchange.com]
+Sent    : 3/18/2024 2:15:00 PM
+To      : David Williams [dwilliams@purviewexchange.com]
+CC      : Legal Team [legal@purviewexchange.com]; Mark Anderson [manderson@purviewexchange.com]
+Subject : Re: Compliance Response to Security Incident
+
+David,
+
+Thank you for the prompt escalation. I've reviewed the preliminary findings with outside counsel and have several compliance concerns that need to be addressed immediately.
+
+1. SOX Implications: Since the breach affected Finance department mailboxes, we need to assess whether any material financial data was exfiltrated. The CFO and Controller mailboxes are in scope for SOX 302/404 certifications. If financial data was compromised, we have a material weakness disclosure obligation.
+
+2. GDPR Notification: Our European operations route email through the same Exchange infrastructure. Under GDPR Article 33, we have 72 hours from the time of discovery to notify the relevant supervisory authority. The clock started at 11:47 PM on March 14th — we are now at T+66 hours.
+
+3. Data Loss Prevention: I recommend we immediately deploy DLP rules on all Exchange mailboxes to detect and block any further exfiltration of financial documents, PII, and confidential legal correspondence.
+
+4. Board Notification: The Audit Committee charter requires notification of any cybersecurity incident affecting financial systems within 48 hours. Mark — please schedule an emergency Audit Committee call for tomorrow morning.
+
+I've also asked our external auditors (PwC) to assess whether this incident impacts their ongoing SOX testing procedures.
+
+Sarah Johnson
+VP of Compliance
+Purview Exchange Corporation

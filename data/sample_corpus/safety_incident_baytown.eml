@@ -1,0 +1,43 @@
+Content-Type: multipart/mixed; boundary="===============0305118757456141196=="
+MIME-Version: 1.0
+From: Francis Ham <fham@bigthorium.com>
+To: William Davis <wdavis@bigthorium.com>
+Cc: Arvind Patel <apatel@bigthorium.com>
+Date: Thu, 18 Apr 2024 09:32:00 -0500
+Subject: URGENT: Safety Incident at Baytown Welding Shop
+
+--===============0305118757456141196==
+Content-Type: text/plain; charset="us-ascii"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+
+Bill,
+
+I need to bring to your attention a serious safety incident that occurred
+yesterday at the Baytown welding facility.
+
+At approximately 2:15 PM, a flash fire broke out in Welding Bay 3 during
+a routine pipe fitting operation. Two workers sustained minor burns and
+were transported to Memorial Hermann for evaluation.
+
+Preliminary investigation suggests:
+- The fire suppression system in Bay 3 was last inspected 18 months ago
+  (should be every 6 months per OSHA 1910.252)
+- The welding curtains were not properly positioned
+- One worker was not wearing required PPE (face shield)
+
+I've already contacted our insurance carrier and OSHA regional office.
+We need to schedule an emergency safety review ASAP.
+
+Francis Ham
+Plant Manager, Baytown Operations
+
+--===============0305118757456141196==
+Content-Type: application/octet-stream
+MIME-Version: 1.0
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="incident_bay3_photo.jpg"
+
+SW5jaWRlbnQgcGhvdG8gcGxhY2Vob2xkZXIgY29udGVudA==
+
+--===============0305118757456141196==--

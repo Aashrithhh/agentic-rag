@@ -1,0 +1,5 @@
+{"query": "What were the issues with the Indian workers at Big Thorium?", "expected_sources": ["recruitment_india.eml"], "expected_answer_keywords": ["Indian", "workers", "recruitment", "housing", "conditions"]}
+{"query": "What were the renewable energy plans discussed for the power plant?", "expected_sources": ["compliance_report_2024.pdf"], "expected_answer_keywords": ["renewable", "energy", "power plant", "solar", "wind"]}
+{"query": "Who is William Davis and what communications did he have about welding?", "expected_sources": ["compliance_report_2024.pdf", "memo_safety_2024.txt"], "expected_answer_keywords": ["William Davis", "welding", "safety"]}
+{"query": "What were the housing conditions for recruited workers?", "expected_sources": ["recruitment_india.eml"], "expected_answer_keywords": ["housing", "conditions", "workers", "accommodation"]}
+{"query": "What safety incidents were discussed in company emails?", "expected_sources": ["safety_incident_baytown.eml", "memo_safety_2024.txt"], "expected_answer_keywords": ["safety", "incident", "Baytown"]}

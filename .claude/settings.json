@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tasklist /fi \"imagename eq OUTLOOK.EXE\")",
+      "Bash(handle64.exe \"techcorp_investigation_2024.pst\")",
+      "Bash(handle.exe \"techcorp_investigation_2024.pst\")",
+      "Bash(powershell -Command \":*)",
+      "Bash(python -c \":*)",
+      "Bash(taskkill /f /im OUTLOOK.EXE)",
+      "Bash(powershell.exe -NoProfile -Command \"Stop-Process -Name OUTLOOK -Force -ErrorAction SilentlyContinue; Start-Sleep 3; Write-Output ''Outlook stopped''\")",
+      "Bash(powershell.exe -NoProfile -Command \"Get-Process -Name OUTLOOK -ErrorAction SilentlyContinue | Select-Object Name,Id\")",
+      "Bash(python scripts/create_demo_pst.py --upload-only --output data/demo_pst/techcorp_investigation_2024.pst --blob-prefix demo-pst)",
+      "Bash(docker ps --filter \"ancestor=pgvector/pgvector\" --format \"{{.ID}} {{.Names}} {{.Status}}\")",
+      "Bash(docker ps --filter \"name=postgres\" --format \"{{.ID}} {{.Names}} {{.Status}}\")",
+      "Bash(docker ps -a --format \"table {{.ID}}\\\\t{{.Names}}\\\\t{{.Image}}\\\\t{{.Status}}\\\\t{{.Mounts}}\")"
+    ]
+  }
+}

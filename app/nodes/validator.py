@@ -2,6 +2,10 @@
 
 Calls /api/validate-all/{table} with pagination (top, skip) and ordering
 to fact-check specific data-points. Uses parallel async httpx calls.
+
+Cache strategy (Option A): only the claim *extraction* step is cached
+(the LLM call).  API verification is always live because external data
+can change between requests.
 """
 
 from __future__ import annotations
@@ -11,10 +15,11 @@ import logging
 from typing import Literal
 
 import httpx
-from langchain_openai import AzureChatOpenAI
+from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
+from app.cache import cache, key_for
 from app.config import settings
 from app.state import AgentState, ValidationResult
 
@@ -93,29 +98,71 @@ def _aggregate_status(results: list[ValidationResult]) -> Literal["pass", "parti
 
 def validator_node(state: AgentState) -> dict:
     """LangGraph node: extract claims and verify them against the external API."""
+    import time as _time
+    from app.metrics import metrics
+    metrics.inc("node_invocations.validator")
+    _t0 = _time.perf_counter()
+    try:
+        return _validator_node_inner(state)
+    finally:
+        metrics.observe("node_latency.validator", _time.perf_counter() - _t0)
+
+
+def _validator_node_inner(state: AgentState) -> dict:
     query = state.get("rewritten_query") or state["query"]
     docs = state.get("retrieved_docs", [])
+    case_id = state.get("case_id", "")
 
     if not docs:
         return {"validation_results": [], "validation_status": "pass"}
 
     doc_text = "\n---\n".join(f"[{d.metadata.get('source', '?')}] {d.page_content}" for d in docs)
 
-    llm = AzureChatOpenAI(
-        azure_deployment=settings.azure_openai_deployment,
-        azure_endpoint=settings.azure_openai_endpoint,
-        api_key=settings.azure_openai_api_key,
-        api_version=settings.azure_openai_api_version,
-        temperature=0, max_tokens=2048,
-    )
-    structured_llm = llm.with_structured_output(ClaimList)
-    chain = _prompt | structured_llm
-    claim_list: ClaimList = chain.invoke({"query": query, "documents": doc_text})
+    # ── Cache check for claim EXTRACTION only (Option A) ──
+    claim_list: ClaimList | None = None
+    if settings.cache_llm_enabled:
+        doc_snippets = [
+            {"source": d.metadata.get("source", "?"),
+             "content_hash": d.page_content[:200]}
+            for d in docs
+        ]
+        ck = key_for(
+            "llm",
+            {"node": "validator_extract", "case_id": case_id,
+             "query": query, "docs": doc_snippets,
+             "model": settings.openai_model,
+             "validation_api_base": settings.validation_api_base},
+            prefix=f"validator:{case_id}",
+        )
+        hit, cached_claims = cache.get("llm", ck)
+        if hit:
+            logger.info("Validator extraction cache HIT — %d claims", len(cached_claims))
+            claim_list = ClaimList(claims=[ExtractedClaim(**c) for c in cached_claims])
+
+    if claim_list is None:
+        llm = ChatOpenAI(
+            model=settings.openai_model,
+            api_key=settings.openai_api_key,
+            temperature=0, max_tokens=2048,
+        )
+        structured_llm = llm.with_structured_output(ClaimList)
+        chain = _prompt | structured_llm
+        from app.resilience import invoke_with_retry
+        claim_list = invoke_with_retry(
+            chain, {"query": query, "documents": doc_text},
+            node_name="validator", fallback=ClaimList(claims=[]),
+        )
+
+        # ── Cache the extracted claims ─────────────────────
+        if settings.cache_llm_enabled:
+            cache.set("llm", ck, [c.model_dump() for c in claim_list.claims])
+            logger.debug("Validator extraction cache MISS — stored %d claims", len(claim_list.claims))
 
     if not claim_list.claims:
         return {"validation_results": [], "validation_status": "pass"}
 
-    logger.info("Validator — verifying %d claims in parallel…", len(claim_list.claims))
+    # API verification is always live (not cached)
+    logger.info("Validator — verifying %d claims in parallel...", len(claim_list.claims))
     results = asyncio.run(_verify_all(claim_list.claims))
     status = _aggregate_status(results)
     return {"validation_results": results, "validation_status": status}

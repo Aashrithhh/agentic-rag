@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''app/blob_storage.py''\\).read\\(\\)\\); print\\(''blob_storage.py OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''app/config.py''\\).read\\(\\)\\); print\\(''config.py OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''scripts/upload_to_blob.py''\\).read\\(\\)\\); print\\(''upload_to_blob.py OK''\\)\")",
+      "Bash(pip install azure-storage-blob --quiet)",
+      "Bash(python -c \":*)",
+      "Bash(pip install slowapi)",
+      "Bash(python -m pytest tests/ -q --tb=short)"
+    ]
+  }
+}

@@ -30,5 +30,13 @@ class AgentState(TypedDict, total=False):
     answer: str
     loop_count: int
     error: str | None
-    metadata_filter: dict
     thinking: str
+
+    # ── Added by production-hardening modules ─────────────
+    intent: str                                      # fact_lookup | summary | timeline | comparison | exploratory
+    intent_confidence: float
+    reranked: bool                                   # whether docs were reranked
+    citation_report: dict                            # from citation_validator
+    post_check_result: dict                          # from answer post-checker
+    quality_downgrade: bool                          # set when fallback model used
+    hitl_review_id: str                              # set when flagged for human review

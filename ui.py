@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 import logging
+import shlex
 from typing import Any
 
 import streamlit as st
@@ -20,16 +21,70 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ── Auth gate (optional password protection) ─────────────────────────
+
+
+def _check_auth() -> None:
+    """Block the UI with a password prompt when auth is enabled."""
+    import hashlib as _hashlib
+    import hmac as _hmac
+    import time as _time
+
+    from app.config import settings as _cfg
+    if not _cfg.ui_auth_enabled:
+        return
+
+    _SESSION_TTL = 4 * 3600  # 4-hour session expiry
+
+    if st.session_state.get("authenticated"):
+        login_time = st.session_state.get("auth_time", 0)
+        if (_time.time() - login_time) < _SESSION_TTL:
+            return
+        st.session_state["authenticated"] = False
+        st.warning("Session expired. Please log in again.")
+
+    st.title("Login Required")
+    pwd = st.text_input("Password", type="password", key="auth_pwd")
+    if st.button("Login"):
+        import logging as _log
+        _auth_logger = _log.getLogger("app.ui.auth")
+        # Timing-safe comparison via HMAC on SHA-256 hashes
+        pwd_hash = _hashlib.sha256(pwd.encode()).hexdigest()
+        expected_hash = _hashlib.sha256(_cfg.ui_auth_password.encode()).hexdigest()
+        if _hmac.compare_digest(pwd_hash, expected_hash):
+            st.session_state["authenticated"] = True
+            st.session_state["auth_time"] = _time.time()
+            _auth_logger.info("UI login successful")
+            st.rerun()
+        else:
+            _auth_logger.warning("UI login failed — invalid password")
+            st.error("Invalid password.")
+    st.stop()
+
+
+_check_auth()
+
 # ── Imports from the app package ────────────────────────────────────
 from app.graph import compile_graph
+from app.cache import cache as app_cache
+from app.config import settings
+from app.db import init_db
 from app.state import AgentState
-from app.cases import CASES, list_cases, get_case, metadata_filter_for_case
+from app.cases import CASES, list_cases, get_case, metadata_filter_for_case, auto_ingest_cases
+from app.integrations.mcp_client import MCPOpsClient, MCPClientError
 
 
 # ── Logging (suppress noisy libs in the UI) ─────────────────────────
 logging.basicConfig(level=logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+# ── Auto-ingest disabled (large blob cases block the UI) ────────────
+# Data is already ingested – use CLI for manual ingestion if needed:
+#   python -m app.ingest --case <case_id>
+if "auto_ingested" not in st.session_state:
+    st.session_state["auto_ingested"] = True
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -138,6 +193,22 @@ st.markdown("""
 # ─────────────────────────────────────────────────────────────────────
 # Sidebar
 # ─────────────────────────────────────────────────────────────────────
+
+
+def _call_mcp_tool(tool_name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not settings.mcp_ops_enabled:
+        return {"error": "MCP Ops is disabled by configuration."}
+
+    try:
+        cmd = settings.mcp_ops_command
+        tool_args = shlex.split(settings.mcp_ops_args, posix=False)
+        client = MCPOpsClient(command=cmd, args=tool_args)
+        return client.call_tool(tool_name, args)
+    except MCPClientError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        return {"error": f"MCP call failed: {exc}"}
+
 with st.sidebar:
     # ── Case selector ──────────────────────────────────────────────
     st.markdown("### 📂 Case Selector")
@@ -156,6 +227,7 @@ with st.sidebar:
 
     st.info(f"**{selected_case.display_name}**  \n{selected_case.description}", icon="🔒")
     st.caption(
+        f"Isolated DB: `audit_rag_{selected_case.case_id.replace('-', '_')}`  \n"
         f"Filter: `doc_type={selected_case.doc_type}`"
         + (f", `entity={selected_case.entity_name}`" if selected_case.entity_name else "")
     )
@@ -190,9 +262,92 @@ with st.sidebar:
             st.rerun()
 
 
+    st.markdown("---")
+    st.markdown("### MCP Ops Diagnostics")
+
+    if settings.mcp_ops_enabled:
+        if st.button("Run DB Health", use_container_width=True):
+            db_status = _call_mcp_tool("case_db_status", {"case_id": selected_case.case_id})
+            vec_status = _call_mcp_tool("pgvector_status", {"case_id": selected_case.case_id})
+            st.session_state["mcp_diag_db"] = {"db": db_status, "pgvector": vec_status}
+
+        if st.button("Check pgvector + indexes", use_container_width=True):
+            idx = _call_mcp_tool("vector_index_status", {"case_id": selected_case.case_id})
+            st.session_state["mcp_diag_idx"] = idx
+
+        mcp_preview_query = st.text_input("Preview Query", value=st.session_state.get("query_text", ""), key="mcp_preview_query")
+        if st.button("Retrieve Preview", use_container_width=True):
+            st.session_state["mcp_diag_preview"] = _call_mcp_tool(
+                "retrieve_preview",
+                {"case_id": selected_case.case_id, "query": mcp_preview_query or "", "top_k": 6},
+            )
+
+        if st.button("Trace Query", use_container_width=True):
+            st.session_state["mcp_diag_trace"] = _call_mcp_tool(
+                "trace_query",
+                {"case_id": selected_case.case_id, "query": mcp_preview_query or "", "max_steps": 20},
+            )
+
+        sql_default = "SELECT source, COUNT(*) AS cnt FROM document_chunks GROUP BY source ORDER BY cnt DESC"
+        mcp_sql = st.text_area("Read-only SQL", value=sql_default, key="mcp_readonly_sql", height=90)
+        if st.button("Run Read-only SQL", use_container_width=True):
+            st.session_state["mcp_diag_sql"] = _call_mcp_tool(
+                "execute_readonly_postgres_sql",
+                {"case_id": selected_case.case_id, "sql": mcp_sql, "limit": 200},
+            )
+
+        if "mcp_diag_db" in st.session_state:
+            with st.expander("DB Health Result", expanded=False):
+                st.json(st.session_state["mcp_diag_db"])
+        if "mcp_diag_idx" in st.session_state:
+            with st.expander("Index Result", expanded=False):
+                st.json(st.session_state["mcp_diag_idx"])
+        if "mcp_diag_preview" in st.session_state:
+            with st.expander("Retrieve Preview Result", expanded=False):
+                st.json(st.session_state["mcp_diag_preview"])
+        if "mcp_diag_trace" in st.session_state:
+            with st.expander("Trace Result", expanded=False):
+                st.json(st.session_state["mcp_diag_trace"])
+        if "mcp_diag_sql" in st.session_state:
+            with st.expander("Read-only SQL Result", expanded=False):
+                st.json(st.session_state["mcp_diag_sql"])
+    else:
+        st.caption("MCP Ops diagnostics disabled via settings.")
+
+    # ── Cache Diagnostics ──────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### Cache Diagnostics")
+    cache_stats = app_cache.stats()
+
+    if cache_stats["enabled"]:
+        ttl_label = "process-lifetime" if cache_stats["ttl_seconds"] == 0 else f"{cache_stats['ttl_seconds']}s"
+        st.caption(f"TTL: {ttl_label} | Max/ns: {cache_stats['max_entries_per_namespace']}")
+
+        col_h, col_m, col_r = st.columns(3)
+        col_h.metric("Hits", cache_stats["total_hits"])
+        col_m.metric("Misses", cache_stats["total_misses"])
+        col_r.metric("Hit Rate", cache_stats["total_hit_rate"])
+
+        with st.expander("Per-namespace details", expanded=False):
+            for ns_name, ns_stats in cache_stats.get("namespaces", {}).items():
+                st.markdown(
+                    f"**{ns_name}** — {ns_stats['size']}/{ns_stats['max_entries']} entries, "
+                    f"{ns_stats['hits']} hits / {ns_stats['misses']} misses "
+                    f"({ns_stats['hit_rate']})"
+                )
+
+        if st.button("Clear all caches", use_container_width=True):
+            removed = app_cache.invalidate_all()
+            st.success(f"Cleared {removed} cache entries.")
+    else:
+        st.caption("Caching is disabled (CACHE_ENABLED=false).")
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────
+
+
 NODE_META: dict[str, dict[str, str]] = {
     "retriever": {"icon": "📥", "label": "Retriever",  "desc": "Hybrid semantic + keyword search via Cohere & pgvector"},
     "grader":    {"icon": "⚖️",  "label": "Grader",     "desc": "LLM-based binary relevance check (GPT-4o)"},
@@ -204,6 +359,9 @@ NODE_META: dict[str, dict[str, str]] = {
 
 def render_step_card(node: str, data: dict[str, Any], css_class: str = "done"):
     """Render a pipeline step as a styled card."""
+    import html as _html
+    _esc = _html.escape
+
     meta = NODE_META.get(node, {"icon": "🔹", "label": node.title(), "desc": ""})
     detail_html = ""
 
@@ -211,7 +369,7 @@ def render_step_card(node: str, data: dict[str, Any], css_class: str = "done"):
         docs = data.get("retrieved_docs", [])
         n = len(docs)
         sources = sorted({d.metadata.get("source", "?") for d in docs})
-        chips = "".join(f'<span class="source-chip">{s}</span>' for s in sources[:8])
+        chips = "".join(f'<span class="source-chip">{_esc(s)}</span>' for s in sources[:8])
         detail_html = f"Retrieved <strong>{n}</strong> document chunks<br/>{chips}"
 
     elif node == "grader":
@@ -219,8 +377,8 @@ def render_step_card(node: str, data: dict[str, Any], css_class: str = "done"):
         reasoning = data.get("grader_reasoning", "")
         icon = "✅" if score == "yes" else "❌"
         detail_html = (
-            f"Relevance: {icon} <strong>{score.upper()}</strong><br/>"
-            f"<em>{reasoning[:200]}</em>"
+            f"Relevance: {icon} <strong>{_esc(score.upper())}</strong><br/>"
+            f"<em>{_esc(reasoning[:200])}</em>"
         )
         if score == "no":
             css_class = "fail"
@@ -228,14 +386,14 @@ def render_step_card(node: str, data: dict[str, Any], css_class: str = "done"):
     elif node == "rewriter":
         rq = data.get("rewritten_query", "")
         loop = data.get("loop_count", 0)
-        detail_html = f"Loop <strong>{loop}</strong> &mdash; rewritten to:<br/><em>{rq[:200]}</em>"
+        detail_html = f"Loop <strong>{loop}</strong> &mdash; rewritten to:<br/><em>{_esc(rq[:200])}</em>"
 
     elif node == "validator":
         status = data.get("validation_status", "pass")
         results = data.get("validation_results", [])
         n_claims = len(results)
         n_valid = sum(1 for r in results if r.get("is_valid"))
-        badge = {"pass": "✅ PASS", "partial": "⚠️ PARTIAL", "fail": "❌ FAIL"}.get(status, status)
+        badge = {"pass": "✅ PASS", "partial": "⚠️ PARTIAL", "fail": "❌ FAIL"}.get(status, _esc(status))
         detail_html = f"Status: <strong>{badge}</strong> &mdash; {n_valid}/{n_claims} claims verified"
         if status == "fail":
             css_class = "fail"
@@ -279,6 +437,14 @@ with col_clear:
 # Execute pipeline
 # ─────────────────────────────────────────────────────────────────────
 if run_clicked and query.strip():
+    # ── Input validation ───────────────────────────────────────
+    if len(query.strip()) > settings.ui_max_query_length:
+        st.error(f"Query too long ({len(query.strip())} chars). Max is {settings.ui_max_query_length}.")
+        st.stop()
+
+    # Ensure the per-case database is ready
+    init_db(selected_case.case_id)
+
     # Build initial state with case-level isolation
     initial_state: AgentState = {
         "query": query.strip(),

@@ -30,10 +30,41 @@ from pathlib import Path
 from langchain_core.documents import Document
 from pypdf import PdfReader
 
+from app.blob_storage import is_blob_mode, iter_files_for_source
 from app.config import settings
 from app.db import init_db, upsert_chunks
 
 logger = logging.getLogger(__name__)
+
+
+# ── Ingestion report for auditing success/failure ─────────────────────
+
+from dataclasses import dataclass, field as _field
+
+
+@dataclass
+class IngestionReport:
+    """Tracks success/failure counts during document ingestion."""
+
+    total_files_found: int = 0
+    files_loaded: int = 0
+    files_failed: int = 0
+    failed_files: list[dict[str, str]] = _field(default_factory=list)
+    chunks_created: int = 0
+    chunks_stored: int = 0
+
+    def record_failure(self, filename: str, error: str) -> None:
+        self.files_failed += 1
+        self.failed_files.append({"file": filename, "error": error[:200]})
+
+    def summary(self) -> str:
+        status = "OK" if self.files_failed == 0 else "PARTIAL"
+        return (
+            f"[{status}] files_found={self.total_files_found} "
+            f"loaded={self.files_loaded} failed={self.files_failed} "
+            f"chunks={self.chunks_stored}"
+        )
+
 
 # File extensions handled by each loader
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
@@ -42,7 +73,7 @@ _IMAGE_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/bmp"
 _AUDIO_MIMES = {"audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav", "audio/ogg",
                 "audio/flac", "audio/mp4", "audio/m4a", "audio/webm", "audio/x-m4a"}
 _AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm"}
-_ALL_SUPPORTED = {".txt", ".pdf", ".docx", *_IMAGE_EXTS, ".eml", ".msg", ".pst"}
+_ALL_SUPPORTED = {".txt", ".pdf", ".docx", *_IMAGE_EXTS, ".eml", ".msg", ".pst", ".json", ".csv"}
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -272,60 +303,57 @@ def _process_attachment(content_type: str, payload: bytes, filename: str) -> str
 # ─────────────────────────────────────────────────────────────────────
 #  1. Plain text loader
 # ─────────────────────────────────────────────────────────────────────
-def load_texts(doc_dir: str | Path) -> list[Document]:
-    """Load .txt files from a directory into Documents."""
-    doc_dir = Path(doc_dir)
+def load_texts(doc_source: str) -> list[Document]:
+    """Load .txt files from a local directory or blob prefix."""
     docs: list[Document] = []
-    for txt_path in sorted(doc_dir.glob("*.txt")):
-        content = txt_path.read_text(encoding="utf-8", errors="replace")
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".txt"}):
+        content = file_bytes.decode("utf-8", errors="replace")
         if not content.strip():
             continue
         docs.append(Document(
             page_content=content,
-            metadata={"source": txt_path.name, "page": 1, "file_type": "txt"},
+            metadata={"source": filename, "page": 1, "file_type": "txt"},
         ))
-    logger.info("Loaded %d .txt files from %s", len(docs), doc_dir)
+    logger.info("Loaded %d .txt files from %s", len(docs), doc_source)
     return docs
 
 
 # ─────────────────────────────────────────────────────────────────────
 #  2. PDF loader (with OCR fallback for scanned pages)
 # ─────────────────────────────────────────────────────────────────────
-def load_pdfs(doc_dir: str | Path) -> list[Document]:
+def load_pdfs(doc_source: str) -> list[Document]:
     """Load .pdf files; falls back to OCR for pages with no extractable text."""
-    doc_dir = Path(doc_dir)
     docs: list[Document] = []
-    for pdf_path in sorted(doc_dir.glob("*.pdf")):
-        reader = PdfReader(str(pdf_path))
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".pdf"}):
+        reader = PdfReader(io.BytesIO(file_bytes))
         for page_num, page in enumerate(reader.pages, start=1):
             text = page.extract_text() or ""
             # OCR fallback for scanned pages
             if not text.strip():
                 try:
                     from PIL import Image
-                    import io
                     for img_obj in page.images:
                         pil_img = Image.open(io.BytesIO(img_obj.data))
                         ocr_text = _ocr_image(pil_img)
                         if ocr_text:
                             text += "\n" + ocr_text
                 except Exception as exc:
-                    logger.debug("PDF OCR fallback skipped for %s p.%d: %s", pdf_path.name, page_num, exc)
+                    logger.debug("PDF OCR fallback skipped for %s p.%d: %s", filename, page_num, exc)
             if not text.strip():
                 continue
             docs.append(Document(
                 page_content=text,
-                metadata={"source": pdf_path.name, "page": page_num,
+                metadata={"source": filename, "page": page_num,
                            "total_pages": len(reader.pages), "file_type": "pdf"},
             ))
-    logger.info("Loaded %d PDF pages from %s", len(docs), doc_dir)
+    logger.info("Loaded %d PDF pages from %s", len(docs), doc_source)
     return docs
 
 
 # ─────────────────────────────────────────────────────────────────────
 #  3. Word (.docx) loader
 # ─────────────────────────────────────────────────────────────────────
-def load_docx(doc_dir: str | Path) -> list[Document]:
+def load_docx(doc_source: str) -> list[Document]:
     """Load .docx files — extracts paragraphs and tables."""
     try:
         from docx import Document as DocxDocument
@@ -333,11 +361,10 @@ def load_docx(doc_dir: str | Path) -> list[Document]:
         logger.warning("python-docx not installed — skipping .docx files. Run: pip install python-docx")
         return []
 
-    doc_dir = Path(doc_dir)
     docs: list[Document] = []
-    for docx_path in sorted(doc_dir.glob("*.docx")):
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".docx"}):
         try:
-            word_doc = DocxDocument(str(docx_path))
+            word_doc = DocxDocument(io.BytesIO(file_bytes))
             paragraphs: list[str] = []
 
             # Extract paragraphs
@@ -360,19 +387,19 @@ def load_docx(doc_dir: str | Path) -> list[Document]:
 
             docs.append(Document(
                 page_content=content,
-                metadata={"source": docx_path.name, "page": 1, "file_type": "docx"},
+                metadata={"source": filename, "page": 1, "file_type": "docx"},
             ))
         except Exception as exc:
-            logger.error("Failed to load %s: %s", docx_path.name, exc)
+            logger.error("Failed to load %s: %s", filename, exc)
 
-    logger.info("Loaded %d .docx files from %s", len(docs), doc_dir)
+    logger.info("Loaded %d .docx files from %s", len(docs), doc_source)
     return docs
 
 
 # ─────────────────────────────────────────────────────────────────────
 #  4. Image loader (OCR via Tesseract)
 # ─────────────────────────────────────────────────────────────────────
-def load_images(doc_dir: str | Path) -> list[Document]:
+def load_images(doc_source: str) -> list[Document]:
     """Load image files and extract text via Tesseract OCR."""
     try:
         from PIL import Image
@@ -380,28 +407,23 @@ def load_images(doc_dir: str | Path) -> list[Document]:
         logger.warning("Pillow not installed — skipping images. Run: pip install Pillow")
         return []
 
-    doc_dir = Path(doc_dir)
     docs: list[Document] = []
-    image_files = []
-    for ext in _IMAGE_EXTS:
-        image_files.extend(doc_dir.glob(f"*{ext}"))
-
-    for img_path in sorted(image_files):
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions=_IMAGE_EXTS):
         try:
-            img = Image.open(str(img_path))
+            img = Image.open(io.BytesIO(file_bytes))
             text = _ocr_image(img)
             if not text:
-                logger.warning("No text extracted from image %s", img_path.name)
+                logger.warning("No text extracted from image %s", filename)
                 continue
             docs.append(Document(
                 page_content=text,
-                metadata={"source": img_path.name, "page": 1, "file_type": "image",
+                metadata={"source": filename, "page": 1, "file_type": "image",
                            "image_size": f"{img.width}x{img.height}"},
             ))
         except Exception as exc:
-            logger.error("Failed to process image %s: %s", img_path.name, exc)
+            logger.error("Failed to process image %s: %s", filename, exc)
 
-    logger.info("Loaded %d images (OCR) from %s", len(docs), doc_dir)
+    logger.info("Loaded %d images (OCR) from %s", len(docs), doc_source)
     return docs
 
 
@@ -465,14 +487,12 @@ def _extract_email_text(msg: email.message.EmailMessage) -> tuple[str, list[str]
     return "\n\n".join(body_parts), attachment_names
 
 
-def load_eml(doc_dir: str | Path) -> list[Document]:
+def load_eml(doc_source: str) -> list[Document]:
     """Load .eml email files with full attachment processing."""
-    doc_dir = Path(doc_dir)
     docs: list[Document] = []
-    for eml_path in sorted(doc_dir.glob("*.eml")):
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".eml"}):
         try:
-            raw = eml_path.read_bytes()
-            msg = email.message_from_bytes(raw, policy=policy.default)
+            msg = email.message_from_bytes(file_bytes, policy=policy.default)
             text, attachments = _extract_email_text(msg)
             if not text.strip():
                 continue
@@ -480,7 +500,7 @@ def load_eml(doc_dir: str | Path) -> list[Document]:
             docs.append(Document(
                 page_content=text,
                 metadata={
-                    "source": eml_path.name, "page": 1, "file_type": "eml",
+                    "source": filename, "page": 1, "file_type": "eml",
                     "email_from": msg.get("From", ""),
                     "email_to": msg.get("To", ""),
                     "email_subject": msg.get("Subject", ""),
@@ -489,16 +509,16 @@ def load_eml(doc_dir: str | Path) -> list[Document]:
                 },
             ))
         except Exception as exc:
-            logger.error("Failed to load %s: %s", eml_path.name, exc)
+            logger.error("Failed to load %s: %s", filename, exc)
 
-    logger.info("Loaded %d .eml files from %s", len(docs), doc_dir)
+    logger.info("Loaded %d .eml files from %s", len(docs), doc_source)
     return docs
 
 
 # ─────────────────────────────────────────────────────────────────────
 #  6. Outlook message (.msg) loader
 # ─────────────────────────────────────────────────────────────────────
-def load_msg(doc_dir: str | Path) -> list[Document]:
+def load_msg(doc_source: str) -> list[Document]:
     """Load .msg Outlook message files with attachment processing."""
     try:
         import extract_msg
@@ -506,11 +526,16 @@ def load_msg(doc_dir: str | Path) -> list[Document]:
         logger.warning("extract-msg not installed — skipping .msg files. Run: pip install extract-msg")
         return []
 
-    doc_dir = Path(doc_dir)
     docs: list[Document] = []
-    for msg_path in sorted(doc_dir.glob("*.msg")):
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".msg"}):
+        tmp_path = None
         try:
-            msg = extract_msg.Message(str(msg_path))
+            # extract_msg requires a filesystem path — write bytes to temp file
+            with tempfile.NamedTemporaryFile(suffix=".msg", delete=False) as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
+
+            msg = extract_msg.Message(tmp_path)
             parts: list[str] = []
 
             # Headers
@@ -561,7 +586,7 @@ def load_msg(doc_dir: str | Path) -> list[Document]:
             docs.append(Document(
                 page_content=content,
                 metadata={
-                    "source": msg_path.name, "page": 1, "file_type": "msg",
+                    "source": filename, "page": 1, "file_type": "msg",
                     "email_from": msg.sender or "",
                     "email_to": msg.to or "",
                     "email_subject": msg.subject or "",
@@ -571,27 +596,27 @@ def load_msg(doc_dir: str | Path) -> list[Document]:
             ))
             msg.close()
         except Exception as exc:
-            logger.error("Failed to load %s: %s", msg_path.name, exc)
+            logger.error("Failed to load %s: %s", filename, exc)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
-    logger.info("Loaded %d .msg files from %s", len(docs), doc_dir)
+    logger.info("Loaded %d .msg files from %s", len(docs), doc_source)
     return docs
 
 
 # ─────────────────────────────────────────────────────────────────────
 #  7. Outlook PST loader (Windows only — uses Outlook COM)
 # ─────────────────────────────────────────────────────────────────────
-def load_pst(doc_dir: str | Path) -> list[Document]:
+def load_pst(doc_source: str) -> list[Document]:
     """Load .pst Outlook data files via Outlook COM automation (Windows only).
 
     Requires Microsoft Outlook installed on the machine.
+    When reading from blob storage the PST file is materialized as a local
+    temp file because Outlook COM requires a real filesystem path.
     """
     if platform.system() != "Windows":
         logger.warning("PST loading requires Windows + Outlook. Skipping .pst files.")
-        return []
-
-    doc_dir = Path(doc_dir)
-    pst_files = sorted(doc_dir.glob("*.pst"))
-    if not pst_files:
         return []
 
     try:
@@ -607,9 +632,16 @@ def load_pst(doc_dir: str | Path) -> list[Document]:
         logger.error("Cannot start Outlook COM — is Outlook installed? %s", exc)
         return []
 
-    for pst_path in pst_files:
-        pst_abs = str(pst_path.resolve())
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".pst"}):
+        tmp_path = None
         try:
+            # Outlook COM requires a real filesystem path — write to temp file
+            with tempfile.NamedTemporaryFile(suffix=".pst", delete=False) as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
+
+            pst_abs = str(Path(tmp_path).resolve())
+
             # Add the PST as a store
             outlook.AddStore(pst_abs)
             # Find the store we just added (it appears as the last folder)
@@ -618,18 +650,31 @@ def load_pst(doc_dir: str | Path) -> list[Document]:
                 # Match by checking all folders; the added PST is typically last
                 store = folder
             if store is None:
-                logger.warning("Could not find added PST store for %s", pst_path.name)
+                logger.warning("Could not find added PST store for %s", filename)
                 continue
 
             # Recursively extract emails from all sub-folders
-            _extract_pst_folder(store, pst_path.name, docs)
+            _extract_pst_folder(store, filename, docs)
 
             # Remove the PST store
             outlook.RemoveStore(store)
         except Exception as exc:
-            logger.error("Failed to process PST %s: %s", pst_path.name, exc)
+            logger.error("Failed to process PST %s: %s", filename, exc)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                # Outlook COM may hold the file for a moment - retry with delay
+                import time
+                for attempt in range(5):
+                    try:
+                        os.unlink(tmp_path)
+                        break
+                    except PermissionError:
+                        if attempt < 4:
+                            time.sleep(0.5)
+                        else:
+                            logger.warning("Could not delete temp PST file %s (in use)", tmp_path)
 
-    logger.info("Loaded %d emails from .pst files in %s", len(docs), doc_dir)
+    logger.info("Loaded %d emails from .pst files in %s", len(docs), doc_source)
     return docs
 
 
@@ -715,62 +760,194 @@ def _extract_pst_folder(folder, pst_name: str, docs: list[Document], max_emails:
 
 
 # ─────────────────────────────────────────────────────────────────────
+#  8. Purview eDiscovery export loader (JSON / CSV)
+# ─────────────────────────────────────────────────────────────────────
+_PURVIEW_KEY_FIELDS = [
+    "Subject/Title", "Sender/Author", "To", "CC", "BCC",
+    "Date", "Participants", "Conversation topic", "Themes list",
+    "Message kind", "File class", "Custodian", "Attachment names",
+    "Email importance", "Compound path", "Dominant theme",
+    "Word count", "Extracted text length",
+]
+
+
+def _purview_item_to_text(item: dict) -> str:
+    """Build a searchable text block from a Purview metadata record."""
+    parts: list[str] = []
+    subject = item.get("Subject/Title", "").strip()
+    if subject:
+        parts.append(f"Subject: {subject}")
+
+    sender = item.get("Sender/Author", "") or item.get("Sender", "")
+    if sender:
+        parts.append(f"From: {sender}")
+
+    for field in ("To", "CC", "BCC"):
+        val = item.get(field, "").strip()
+        if val:
+            parts.append(f"{field}: {val}")
+
+    date = item.get("Date", "") or item.get("Email date sent", "")
+    if date:
+        parts.append(f"Date: {date}")
+
+    topic = item.get("Conversation topic", "").strip()
+    if topic:
+        parts.append(f"Topic: {topic}")
+
+    participants = item.get("Participants", "").strip()
+    if participants:
+        parts.append(f"Participants: {participants}")
+
+    kind = item.get("Message kind", "").strip()
+    if kind:
+        parts.append(f"Type: {kind}")
+
+    attachments = item.get("Attachment names", "").strip()
+    if attachments:
+        parts.append(f"Attachments: {attachments}")
+
+    themes = item.get("Themes list", "").strip()
+    if themes:
+        parts.append(f"Themes: {themes}")
+
+    importance = item.get("Email importance", "").strip()
+    if importance and importance.lower() != "normal":
+        parts.append(f"Importance: {importance}")
+
+    return "\n".join(parts)
+
+
+def load_purview_json(doc_source: str) -> list[Document]:
+    """Load Purview eDiscovery JSON export (Items_*.json files)."""
+    import json as _json
+
+    docs: list[Document] = []
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".json"}):
+        # Only process Purview Items JSON files
+        if not filename.lower().startswith("items"):
+            logger.debug("Skipping non-Items JSON: %s", filename)
+            continue
+
+        try:
+            items = _json.loads(file_bytes.decode("utf-8", errors="replace"))
+            if not isinstance(items, list):
+                logger.warning("Unexpected JSON structure in %s (not an array)", filename)
+                continue
+
+            for idx, item in enumerate(items):
+                text = _purview_item_to_text(item)
+                if not text.strip():
+                    continue
+
+                subject = item.get("Subject/Title", "")
+                sender = item.get("Sender/Author", "") or item.get("Sender", "")
+                msg_kind = item.get("Message kind", "")
+                file_class = item.get("File class", "")
+
+                docs.append(Document(
+                    page_content=text,
+                    metadata={
+                        "source": filename,
+                        "page": idx + 1,
+                        "file_type": "purview-json",
+                        "email_from": sender,
+                        "email_to": item.get("To", ""),
+                        "email_subject": subject,
+                        "email_date": item.get("Date", ""),
+                        "message_kind": msg_kind,
+                        "file_class": file_class,
+                        "custodian": item.get("Custodian", ""),
+                        "file_id": item.get("File ID", ""),
+                    },
+                ))
+
+            logger.info("Loaded %d Purview items from %s", len(docs), filename)
+        except Exception as exc:
+            logger.error("Failed to load Purview JSON %s: %s", filename, exc)
+
+    logger.info("Loaded %d Purview items total from %s", len(docs), doc_source)
+    return docs
+
+
+def load_purview_csv(doc_source: str) -> list[Document]:
+    """Load Purview eDiscovery CSV export (Items_*.csv files)."""
+    import csv as _csv
+
+    docs: list[Document] = []
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".csv"}):
+        if not filename.lower().startswith("items"):
+            logger.debug("Skipping non-Items CSV: %s", filename)
+            continue
+
+        try:
+            text_data = file_bytes.decode("utf-8-sig", errors="replace")
+            reader = _csv.DictReader(io.StringIO(text_data))
+
+            count = 0
+            for idx, row in enumerate(reader):
+                item_text = _purview_item_to_text(row)
+                if not item_text.strip():
+                    continue
+
+                subject = row.get("Subject/Title", "")
+                sender = row.get("Sender/Author", "") or row.get("Sender", "")
+
+                docs.append(Document(
+                    page_content=item_text,
+                    metadata={
+                        "source": filename,
+                        "page": idx + 1,
+                        "file_type": "purview-csv",
+                        "email_from": sender,
+                        "email_to": row.get("To", ""),
+                        "email_subject": subject,
+                        "email_date": row.get("Date", ""),
+                        "message_kind": row.get("Message kind", ""),
+                        "file_class": row.get("File class", ""),
+                        "custodian": row.get("Custodian", ""),
+                        "file_id": row.get("File ID", ""),
+                    },
+                ))
+                count += 1
+
+            logger.info("Loaded %d Purview items from %s", count, filename)
+        except Exception as exc:
+            logger.error("Failed to load Purview CSV %s: %s", filename, exc)
+
+    logger.info("Loaded %d Purview items total from %s", len(docs), doc_source)
+    return docs
+
+
+# ─────────────────────────────────────────────────────────────────────
 #  Master loader — dispatches to all format-specific loaders
 # ─────────────────────────────────────────────────────────────────────
-def load_documents(doc_dir: str | Path) -> list[Document]:
-    """Load all supported file types from a directory.
+def load_documents(doc_source: str) -> list[Document]:
+    """Load all supported file types from a local directory or blob prefix.
 
     Supported: .txt, .pdf, .docx, .png/.jpg/.tiff/.bmp (OCR),
-               .eml, .msg, .pst
+               .eml, .msg, .pst, .json/.csv (Purview eDiscovery)
     """
-    doc_dir = Path(doc_dir)
     docs: list[Document] = []
-
-    # Count files by type for the summary
     file_counts: dict[str, int] = {}
 
-    # Text
-    if any(doc_dir.glob("*.txt")):
-        loaded = load_texts(doc_dir)
-        file_counts["txt"] = len(loaded)
-        docs.extend(loaded)
-
-    # PDF
-    if any(doc_dir.glob("*.pdf")):
-        loaded = load_pdfs(doc_dir)
-        file_counts["pdf"] = len(loaded)
-        docs.extend(loaded)
-
-    # Word
-    if any(doc_dir.glob("*.docx")):
-        loaded = load_docx(doc_dir)
-        file_counts["docx"] = len(loaded)
-        docs.extend(loaded)
-
-    # Images (OCR)
-    has_images = any(any(doc_dir.glob(f"*{ext}")) for ext in _IMAGE_EXTS)
-    if has_images:
-        loaded = load_images(doc_dir)
-        file_counts["images"] = len(loaded)
-        docs.extend(loaded)
-
-    # Email (.eml)
-    if any(doc_dir.glob("*.eml")):
-        loaded = load_eml(doc_dir)
-        file_counts["eml"] = len(loaded)
-        docs.extend(loaded)
-
-    # Outlook (.msg)
-    if any(doc_dir.glob("*.msg")):
-        loaded = load_msg(doc_dir)
-        file_counts["msg"] = len(loaded)
-        docs.extend(loaded)
-
-    # Outlook PST
-    if any(doc_dir.glob("*.pst")):
-        loaded = load_pst(doc_dir)
-        file_counts["pst"] = len(loaded)
-        docs.extend(loaded)
+    # Each loader calls iter_files_for_source internally and handles
+    # empty iteration gracefully, so no pre-check needed.
+    for label, loader in [
+        ("txt",    load_texts),
+        ("pdf",    load_pdfs),
+        ("docx",   load_docx),
+        ("images", load_images),
+        ("eml",    load_eml),
+        ("msg",    load_msg),
+        ("pst",    load_pst),
+        ("purview-json", load_purview_json),
+        ("purview-csv",  load_purview_csv),
+    ]:
+        loaded = loader(doc_source)
+        if loaded:
+            file_counts[label] = len(loaded)
+            docs.extend(loaded)
 
     summary = " | ".join(f"{ext}: {cnt}" for ext, cnt in file_counts.items() if cnt)
     logger.info("Total documents loaded: %d  (%s)", len(docs), summary or "none")
@@ -850,31 +1027,155 @@ def embed_chunks(chunks: list[Document], batch_size: int = 48) -> list[dict]:
     return rows
 
 
-def ingest(doc_dir: str | Path, *, doc_type: str | None = None, entity_name: str | None = None) -> int:
-    engine = init_db()
-    raw_docs = load_documents(doc_dir)
+def ingest(
+    doc_source: str,
+    *,
+    case_id: str,
+    doc_type: str | None = None,
+    entity_name: str | None = None,
+) -> tuple[int, IngestionReport]:
+    """Ingest documents into the **per-case** isolated database.
+
+    ``doc_source`` is either a local directory path or a blob prefix
+    (when Azure Blob Storage is configured).  ``case_id`` is mandatory
+    — it determines which database receives the chunks.
+
+    Returns ``(chunks_inserted, report)`` where *report* tracks
+    per-file success/failure for auditability.
+
+    Guardrail: when ``settings.require_blob_source`` is True, raises
+    RuntimeError if Azure Blob Storage is not configured.
+    """
+    from app.blob_storage import is_blob_mode
+
+    # ── Guardrail: reject non-blob sources when required ─────────
+    if settings.require_blob_source and not is_blob_mode():
+        raise RuntimeError(
+            "Ingestion BLOCKED: require_blob_source=True but Azure Blob "
+            "Storage is not configured. Set AZURE_STORAGE_SAS_URL or "
+            "AZURE_STORAGE_CONNECTION_STRING, or set REQUIRE_BLOB_SOURCE=false."
+        )
+
+    engine = init_db(case_id)
+
+    # ── Load ─────────────────────────────────────────────────────
+    report = IngestionReport()
+    raw_docs = load_documents(doc_source)
+    report.total_files_found = len(raw_docs)
+    report.files_loaded = len(raw_docs)
+    logger.info("[metrics] files_read=%d from source=%s", len(raw_docs), doc_source)
+    if not raw_docs:
+        logger.warning("No documents loaded from %s — nothing to ingest.", doc_source)
+        return 0, report
+
     if doc_type or entity_name:
         for d in raw_docs:
             if doc_type: d.metadata["doc_type"] = doc_type
             if entity_name: d.metadata["entity_name"] = entity_name
-    chunks = chunk_documents(raw_docs)
+
+    # ── Chunk ────────────────────────────────────────────────────
+    if settings.use_structure_aware_chunking:
+        from app.chunking import chunk_documents_structured
+        chunks = chunk_documents_structured(raw_docs)
+    else:
+        chunks = chunk_documents(raw_docs)
+    skipped = len(raw_docs) - len(chunks) if len(chunks) < len(raw_docs) else 0
+    logger.info(
+        "[metrics] docs=%d  chunks_created=%d  chunks_skipped=%d  "
+        "chunk_size=%d  chunk_overlap=%d",
+        len(raw_docs), len(chunks), skipped,
+        settings.chunk_size, settings.chunk_overlap,
+    )
+
+    # ── PII redaction (before embedding) ──────────────────────────
+    if settings.pii_redaction_enabled:
+        from app.pii_redaction import redact_document_chunks
+        chunks, pii_stats = redact_document_chunks(chunks, mode=settings.pii_redaction_mode)
+        if pii_stats.get("total_detections", 0) > 0:
+            logger.info(
+                "[pii] Redacted %d PII instances across %d/%d chunks in case '%s'",
+                pii_stats["total_detections"],
+                pii_stats.get("chunks_with_pii", 0),
+                len(chunks),
+                case_id,
+            )
+            try:
+                from app.audit_log import audit_log
+                audit_log.log_pii_event(
+                    action="redacted",
+                    case_id=case_id,
+                    details=pii_stats,
+                )
+            except Exception:
+                pass
+
+    # ── Embed ─────────────────────────────────────────────────────
     rows = embed_chunks(chunks)
-    return upsert_chunks(engine, rows)
+
+    # ── Enrich (optional, LLM-based) ──────────────────────────────
+    if settings.enable_metadata_enrichment:
+        from app.enrichment import enrich_chunks_batch
+        rows = enrich_chunks_batch(rows, batch_size=settings.enrichment_batch_size)
+
+    # ── Store ─────────────────────────────────────────────────────
+    inserted = upsert_chunks(engine, rows)
+    logger.info(
+        "[metrics] embeddings_written=%d  case=%s  source=%s",
+        inserted, case_id, doc_source,
+    )
+
+    # ── Invalidate retrieval cache for this case ──────────
+    # New chunks change search results; embedding cache is safe to keep.
+    from app.cache import cache
+    removed = cache.invalidate_case_retrieval_cache(case_id)
+    if removed:
+        logger.info("[cache] Invalidated %d retrieval cache entries for case '%s'", removed, case_id)
+
+    report.chunks_created = len(chunks)
+    report.chunks_stored = inserted
+    logger.info("[report] %s", report.summary())
+    if report.files_failed > 0:
+        logger.warning("[report] Failed files: %s", [f["file"] for f in report.failed_files])
+
+    return inserted, report
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Ingest documents into pgvector")
-    parser.add_argument("--dir", dest="doc_dir", help="Directory with .txt and/or .pdf files")
+    parser.add_argument("--dir", dest="doc_dir", help="Local directory with documents")
+    parser.add_argument("--blob-prefix", dest="blob_prefix", help="Azure Blob Storage prefix (e.g. big-thorium)")
     parser.add_argument("--pdf-dir", dest="pdf_dir", help="(Legacy) Directory with PDFs")
-    parser.add_argument("--doc-type", default=None)
+    parser.add_argument("--case", dest="case_id", required=True, help="Case ID for database isolation (e.g. big-thorium)")
+    parser.add_argument("--doc-type", default=None, help="Document type (auto-detected from case config if omitted)")
     parser.add_argument("--entity-name", default=None)
     args = parser.parse_args()
-    doc_dir = args.doc_dir or args.pdf_dir
-    if not doc_dir:
-        parser.error("Provide --dir or --pdf-dir")
+
+    doc_source = args.blob_prefix or args.doc_dir or args.pdf_dir
+    if not doc_source:
+        parser.error("Provide --dir, --blob-prefix, or --pdf-dir")
+
+    # Auto-fetch doc_type from case config if not specified
+    doc_type = args.doc_type
+    entity_name = args.entity_name
+    if doc_type is None or entity_name is None:
+        try:
+            from app.cases import get_case
+            case_cfg = get_case(args.case_id)
+            if doc_type is None:
+                doc_type = case_cfg.doc_type
+            if entity_name is None:
+                entity_name = case_cfg.entity_name
+        except KeyError:
+            pass  # Case not registered, use whatever was provided
+
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
-    count = ingest(doc_dir, doc_type=args.doc_type, entity_name=args.entity_name)
-    print(f"\n✓ Ingested {count} chunks into pgvector.")
+    count, report = ingest(doc_source, case_id=args.case_id, doc_type=doc_type, entity_name=entity_name)
+    print(f"\nIngested {count} chunks into per-case database for '{args.case_id}'.")
+    print(f"Report: {report.summary()}")
+    if report.files_failed > 0:
+        print(f"WARNING: {report.files_failed} file(s) failed to load:")
+        for f in report.failed_files:
+            print(f"  - {f['file']}: {f['error']}")
 
 
 if __name__ == "__main__":

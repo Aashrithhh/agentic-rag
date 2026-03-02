@@ -4,8 +4,12 @@
                 │   START     │
                 └─────┬──────┘
                       ▼
+            ┌──────────────────┐
+            │  Intent Router   │  ← classifies query intent
+            └────────┬─────────┘
+                     ▼
               ┌───────────────┐
-              │   Retriever   │  ← hybrid HNSW + GIN search
+              │   Retriever   │  ← hybrid HNSW + GIN search + reranking
               └───────┬───────┘
                       ▼
               ┌───────────────┐
@@ -20,7 +24,7 @@
      └─────┬──────┘   └──────────────┘  │
            ▼                loops ───────┘
      ┌────────────┐
-     │  Generator  │
+     │  Generator  │  ← citation validation + HITL flagging
      └─────┬──────┘
            ▼
        ┌───────┐
@@ -45,6 +49,31 @@ from app.state import AgentState
 logger = logging.getLogger(__name__)
 
 
+# ── Intent Router Node ───────────────────────────────────────────────
+
+def intent_router_node(state: AgentState) -> dict:
+    """Classify query intent and set retrieval parameters."""
+    if not settings.intent_routing_enabled:
+        return {}
+
+    from app.intent_router import route_query
+    query = state.get("rewritten_query") or state["query"]
+    try:
+        result = route_query(query)
+        logger.info(
+            "Intent router — intent=%s confidence=%.2f",
+            result.get("intent", "unknown"),
+            result.get("confidence", 0.0),
+        )
+        return {
+            "intent": result.get("intent", "fact_lookup"),
+            "intent_confidence": result.get("confidence", 0.0),
+        }
+    except Exception as exc:
+        logger.warning("Intent routing failed: %s", exc)
+        return {"intent": "fact_lookup", "intent_confidence": 0.0}
+
+
 def _route_after_grader(state: AgentState) -> str:
     score = state.get("grader_score", "no")
     loop = state.get("loop_count", 0)
@@ -59,13 +88,15 @@ def _route_after_grader(state: AgentState) -> str:
 def build_graph() -> StateGraph:
     graph = StateGraph(AgentState)
 
+    graph.add_node("intent_router", intent_router_node)
     graph.add_node("retriever", retriever_node)
     graph.add_node("grader", grader_node)
     graph.add_node("rewriter", rewriter_node)
     graph.add_node("validator", validator_node)
     graph.add_node("generator", generator_node)
 
-    graph.set_entry_point("retriever")
+    graph.set_entry_point("intent_router")
+    graph.add_edge("intent_router", "retriever")
     graph.add_edge("retriever", "grader")
     graph.add_conditional_edges("grader", _route_after_grader, {
         "validator": "validator",

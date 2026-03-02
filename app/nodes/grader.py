@@ -5,10 +5,11 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
-from langchain_openai import AzureChatOpenAI
+from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
+from app.cache import cache, key_for
 from app.config import settings
 from app.state import AgentState
 
@@ -42,8 +43,20 @@ _prompt = ChatPromptTemplate.from_messages([("system", _SYSTEM), ("human", _HUMA
 
 def grader_node(state: AgentState) -> dict:
     """LangGraph node: grade retrieved-doc relevance."""
+    import time as _time
+    from app.metrics import metrics
+    metrics.inc("node_invocations.grader")
+    _t0 = _time.perf_counter()
+    try:
+        return _grader_node_inner(state)
+    finally:
+        metrics.observe("node_latency.grader", _time.perf_counter() - _t0)
+
+
+def _grader_node_inner(state: AgentState) -> dict:
     query = state.get("rewritten_query") or state["query"]
     docs = state.get("retrieved_docs", [])
+    case_id = state.get("case_id", "")
 
     if not docs:
         return {"grader_score": "no", "grader_reasoning": "No documents were retrieved."}
@@ -53,17 +66,44 @@ def grader_node(state: AgentState) -> dict:
         for d in docs
     )
 
-    llm = AzureChatOpenAI(
-        azure_deployment=settings.azure_openai_deployment,
-        azure_endpoint=settings.azure_openai_endpoint,
-        api_key=settings.azure_openai_api_key,
-        api_version=settings.azure_openai_api_version,
+    # ── Cache check (key: query + doc snippets + model) ────
+    if settings.cache_llm_enabled:
+        doc_snippets = [
+            {"source": d.metadata.get("source", "?"),
+             "page": d.metadata.get("page"),
+             "content_hash": d.page_content[:200]}
+            for d in docs
+        ]
+        ck = key_for(
+            "llm",
+            {"node": "grader", "case_id": case_id, "query": query,
+             "docs": doc_snippets, "model": settings.openai_model},
+            prefix=f"grader:{case_id}",
+        )
+        hit, cached = cache.get("llm", ck)
+        if hit:
+            logger.info("Grader cache HIT — score=%s", cached["grader_score"])
+            return cached
+
+    llm = ChatOpenAI(
+        model=settings.openai_model,
+        api_key=settings.openai_api_key,
         temperature=0,
         max_tokens=1024,
     )
     structured_llm = llm.with_structured_output(GradeResult)
     chain = _prompt | structured_llm
-    result: GradeResult = chain.invoke({"query": query, "documents": doc_texts})
+    from app.resilience import invoke_with_retry
+    result: GradeResult = invoke_with_retry(
+        chain, {"query": query, "documents": doc_texts}, node_name="grader",
+    )
+
+    output = {"grader_score": result.score, "grader_reasoning": result.reasoning}
+
+    # ── Cache store ────────────────────────────────────────
+    if settings.cache_llm_enabled:
+        cache.set("llm", ck, output)
+        logger.debug("Grader cache MISS — stored result")
 
     logger.info("Grader — score=%s  reasoning=%s", result.score, result.reasoning[:120])
-    return {"grader_score": result.score, "grader_reasoning": result.reasoning}
+    return output

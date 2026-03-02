@@ -218,13 +218,13 @@ def redact_pii(text: str) -> RedactionResult:
 def redact_document_chunks(
     chunks: list[dict[str, Any]],
     mode: Literal["redact", "detect"] = "redact",
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+) -> tuple[list, dict[str, Any]]:
     """Apply PII redaction to a batch of document chunks before indexing.
 
     Parameters
     ----------
-    chunks : list[dict]
-        Chunks in the format produced by the chunking pipeline.
+    chunks : list
+        Chunks in the format produced by the chunking pipeline (Document objects or dicts).
     mode : str
         ``"redact"`` — replace PII with placeholders (default)
         ``"detect"`` — flag PII but don't modify content
@@ -240,7 +240,14 @@ def redact_document_chunks(
     pii_type_counts: dict[str, int] = {}
 
     for chunk in chunks:
-        content = chunk.get("content", "")
+        # Handle both dict and Document objects
+        if hasattr(chunk, "page_content"):
+            content = chunk.page_content
+        elif isinstance(chunk, dict):
+            content = chunk.get("content", chunk.get("page_content", ""))
+        else:
+            content = str(chunk)
+            
         result = redact_pii(content) if mode == "redact" else _detect_only(content)
 
         if result.has_pii:
@@ -251,13 +258,21 @@ def redact_document_chunks(
                 pii_type_counts[d.pii_type] = pii_type_counts.get(d.pii_type, 0) + 1
 
             if mode == "redact":
-                chunk["content"] = result.redacted_text
-                # Store PII metadata for audit
-                extra = chunk.get("metadata_extra") or {}
-                extra["pii_redacted"] = True
-                extra["pii_types"] = sorted(result.pii_types_found)
-                extra["pii_count"] = result.total_detections
-                chunk["metadata_extra"] = extra
+                # Update content based on object type
+                if hasattr(chunk, "page_content"):
+                    chunk.page_content = result.redacted_text
+                    # Store PII metadata
+                    if hasattr(chunk, "metadata"):
+                        chunk.metadata["pii_redacted"] = True
+                        chunk.metadata["pii_types"] = sorted(result.pii_types_found)
+                        chunk.metadata["pii_count"] = result.total_detections
+                elif isinstance(chunk, dict):
+                    chunk["content"] = result.redacted_text
+                    extra = chunk.get("metadata_extra") or {}
+                    extra["pii_redacted"] = True
+                    extra["pii_types"] = sorted(result.pii_types_found)
+                    extra["pii_count"] = result.total_detections
+                    chunk["metadata_extra"] = extra
 
             metrics.inc("pii_detections", result.total_detections)
 

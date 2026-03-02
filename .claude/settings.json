@@ -12,7 +12,11 @@
       "Bash(python scripts/create_demo_pst.py --upload-only --output data/demo_pst/techcorp_investigation_2024.pst --blob-prefix demo-pst)",
       "Bash(docker ps --filter \"ancestor=pgvector/pgvector\" --format \"{{.ID}} {{.Names}} {{.Status}}\")",
       "Bash(docker ps --filter \"name=postgres\" --format \"{{.ID}} {{.Names}} {{.Status}}\")",
-      "Bash(docker ps -a --format \"table {{.ID}}\\\\t{{.Names}}\\\\t{{.Image}}\\\\t{{.Status}}\\\\t{{.Mounts}}\")"
+      "Bash(docker ps -a --format \"table {{.ID}}\\\\t{{.Names}}\\\\t{{.Image}}\\\\t{{.Status}}\\\\t{{.Mounts}}\")",
+      "Bash(python -m pytest tests/test_resilience.py -q --tb=short)",
+      "Bash(pip install openpyxl xlrd python-pptx striprtf olefile)",
+      "Bash(pip install olefile)",
+      "Bash(pip show olefile)"
     ]
   }
 }

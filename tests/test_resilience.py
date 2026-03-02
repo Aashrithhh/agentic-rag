@@ -49,7 +49,8 @@ def test_invoke_retry_then_succeed():
     assert chain.call_count == 2
 
 
-def test_invoke_all_fail_with_fallback():
+@patch("app.resilience._try_fallback_model", return_value=None)
+def test_invoke_all_fail_with_fallback(_mock_fb):
     """When all retries fail and fallback is provided, return fallback."""
     chain = _FakeChain([RuntimeError("fail")] * 3)
     fallback = {"answer": "fallback"}
@@ -60,7 +61,8 @@ def test_invoke_all_fail_with_fallback():
     assert chain.call_count == 3
 
 
-def test_invoke_all_fail_no_fallback_raises():
+@patch("app.resilience._try_fallback_model", return_value=None)
+def test_invoke_all_fail_no_fallback_raises(_mock_fb):
     """When all retries fail and no fallback, raise the exception."""
     chain = _FakeChain([RuntimeError("fail")] * 3)
     with pytest.raises(RuntimeError, match="fail"):

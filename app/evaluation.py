@@ -481,6 +481,19 @@ def load_test_set(path: str | Path) -> list[TestQuestion]:
     return questions
 
 
+def run_batch_evaluation(case_id: str, eval_file: str) -> dict[str, Any]:
+    """Convenience wrapper for job_queue — evaluate a case from a test-set file.
+
+    Loads a JSONL test set (or falls back to case sample_questions), runs
+    ``evaluate_case()``, and returns the aggregate report dict.
+    """
+    test_questions: list[TestQuestion] | None = None
+    if eval_file:
+        test_questions = load_test_set(eval_file)
+    results = evaluate_case(case_id, test_questions)
+    return generate_report(results)
+
+
 # ── CLI entry point ──────────────────────────────────────────────────
 
 

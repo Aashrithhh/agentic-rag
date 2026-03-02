@@ -4,9 +4,22 @@ Supported formats:
     .txt   — Plain text files
     .pdf   — PDF documents (with OCR fallback for scanned pages)
     .docx  — Microsoft Word documents
+    .xlsx  — Excel spreadsheets (openpyxl)
+    .xls   — Legacy Excel spreadsheets (xlrd)
+    .pptx  — PowerPoint presentations (python-pptx)
+    .md    — Markdown files
+    .rtf   — Rich Text Format (striprtf)
+    .doc   — Legacy Word binary (best-effort via olefile)
+    .xml   — XML documents
+    .csv   — CSV files (generic + Purview eDiscovery)
+    .tsv   — Tab-separated values
+    .log   — Log files (plain text)
+    .zip   — Archive files (recursive extraction with safety guards)
+    .json  — JSON files (generic + Purview eDiscovery)
+    .html / .htm — HTML files
     .png / .jpg / .jpeg / .tiff / .bmp — Images (via OCR)
-    .eml   — Standard email files (with image OCR & audio transcription for attachments)
-    .msg   — Outlook message files (with image OCR & audio transcription for attachments)
+    .eml   — Standard email files (with attachment processing)
+    .msg   — Outlook message files (with attachment processing)
     .pst   — Outlook data files (requires Outlook on Windows)
 
 Usage:
@@ -20,11 +33,14 @@ import argparse
 import base64
 import email
 import io
+import json
 import logging
 import os
 import platform
+import re
 import tempfile
 from email import policy
+from html import unescape
 from pathlib import Path
 
 from langchain_core.documents import Document
@@ -73,7 +89,34 @@ _IMAGE_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/bmp"
 _AUDIO_MIMES = {"audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav", "audio/ogg",
                 "audio/flac", "audio/mp4", "audio/m4a", "audio/webm", "audio/x-m4a"}
 _AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm"}
-_ALL_SUPPORTED = {".txt", ".pdf", ".docx", *_IMAGE_EXTS, ".eml", ".msg", ".pst", ".json", ".csv"}
+_ALL_SUPPORTED = {
+    ".txt",
+    ".pdf",
+    ".docx",
+    ".xlsx", ".xls",
+    ".pptx",
+    ".md",
+    ".rtf", ".doc",
+    ".xml",
+    ".json",
+    ".csv", ".tsv",
+    ".log",
+    ".zip",
+    ".html", ".htm",
+    *_IMAGE_EXTS,
+    ".eml",
+    ".msg",
+    ".pst",
+}
+
+# ── ZIP archive safety limits ──────────────────────────────────────
+_ZIP_MAX_NESTING_DEPTH = 2
+_ZIP_MAX_TOTAL_BYTES = 500 * 1024 * 1024   # 500 MB
+_ZIP_MAX_FILE_COUNT = 10_000
+_zip_current_depth = 0
+
+# ── CSV/TSV batching ──────────────────────────────────────────────
+_CSV_BATCH_SIZE = 50
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -762,6 +805,557 @@ def _extract_pst_folder(folder, pst_name: str, docs: list[Document], max_emails:
 # ─────────────────────────────────────────────────────────────────────
 #  8. Purview eDiscovery export loader (JSON / CSV)
 # ─────────────────────────────────────────────────────────────────────
+def _flatten_json_for_text(value: object) -> str:
+    """Convert JSON-like data into readable text for chunking/embedding."""
+    if isinstance(value, dict):
+        lines: list[str] = []
+        for key, val in value.items():
+            if isinstance(val, (dict, list)):
+                child = _flatten_json_for_text(val)
+                if child:
+                    lines.append(f"{key}:")
+                    lines.append(child)
+            else:
+                lines.append(f"{key}: {val}")
+        return "\n".join(lines)
+    if isinstance(value, list):
+        return "\n".join(_flatten_json_for_text(item) for item in value)
+    return str(value)
+
+
+def load_generic_json(doc_source: str) -> list[Document]:
+    """Load non-Purview JSON files as readable text."""
+    docs: list[Document] = []
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".json"}):
+        # Items*.json is handled by the Purview-specific loader below.
+        if filename.lower().startswith("items"):
+            continue
+        try:
+            data = json.loads(file_bytes.decode("utf-8", errors="replace"))
+        except Exception as exc:
+            logger.error("Failed to parse JSON %s: %s", filename, exc)
+            continue
+
+        text = _flatten_json_for_text(data).strip()
+        if not text:
+            continue
+
+        docs.append(
+            Document(
+                page_content=text,
+                metadata={"source": filename, "page": 1, "file_type": "json"},
+            )
+        )
+
+    logger.info("Loaded %d generic JSON files from %s", len(docs), doc_source)
+    return docs
+
+
+def _html_to_text(html_text: str) -> str:
+    """Best-effort HTML to plain text without external dependencies."""
+    cleaned = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html_text)
+    cleaned = re.sub(r"(?i)<br\s*/?>", "\n", cleaned)
+    cleaned = re.sub(r"(?i)</p\s*>", "\n", cleaned)
+    cleaned = re.sub(r"(?is)<[^>]+>", " ", cleaned)
+    cleaned = unescape(cleaned)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def load_html(doc_source: str) -> list[Document]:
+    """Load .html/.htm files and convert to plain text."""
+    docs: list[Document] = []
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".html", ".htm"}):
+        html_text = file_bytes.decode("utf-8", errors="replace")
+        text = _html_to_text(html_text)
+        if not text:
+            continue
+        docs.append(
+            Document(
+                page_content=text,
+                metadata={"source": filename, "page": 1, "file_type": "html"},
+            )
+        )
+    logger.info("Loaded %d HTML files from %s", len(docs), doc_source)
+    return docs
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  9. Excel spreadsheet (.xlsx) loader
+# ─────────────────────────────────────────────────────────────────────
+
+
+def load_xlsx(doc_source: str) -> list[Document]:
+    """Load .xlsx files — extracts each sheet as a table."""
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        logger.warning("openpyxl not installed — skipping .xlsx files. Run: pip install openpyxl")
+        return []
+
+    docs: list[Document] = []
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".xlsx"}):
+        try:
+            wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+            for sheet_idx, sheet_name in enumerate(wb.sheetnames, start=1):
+                ws = wb[sheet_name]
+                rows: list[str] = []
+                for row in ws.iter_rows(values_only=True):
+                    cells = [str(c) if c is not None else "" for c in row]
+                    if any(cells):
+                        rows.append(" | ".join(cells))
+                if not rows:
+                    continue
+                content = f"Sheet: {sheet_name}\n\n[TABLE]\n" + "\n".join(rows) + "\n[/TABLE]"
+                docs.append(Document(
+                    page_content=content,
+                    metadata={
+                        "source": filename, "page": sheet_idx,
+                        "file_type": "xlsx", "sheet_name": sheet_name,
+                        "row_count": len(rows),
+                    },
+                ))
+            wb.close()
+        except Exception as exc:
+            logger.error("Failed to load %s: %s", filename, exc)
+
+    logger.info("Loaded %d .xlsx sheets from %s", len(docs), doc_source)
+    return docs
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  10. Legacy Excel spreadsheet (.xls) loader
+# ─────────────────────────────────────────────────────────────────────
+
+
+def load_xls(doc_source: str) -> list[Document]:
+    """Load .xls files (legacy Excel 97-2003) — extracts each sheet as a table."""
+    try:
+        import xlrd
+    except ImportError:
+        logger.warning("xlrd not installed — skipping .xls files. Run: pip install xlrd>=2.0.1")
+        return []
+
+    docs: list[Document] = []
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".xls"}):
+        try:
+            wb = xlrd.open_workbook(file_contents=file_bytes)
+            for sheet_idx in range(wb.nsheets):
+                ws = wb.sheet_by_index(sheet_idx)
+                rows: list[str] = []
+                for row_num in range(ws.nrows):
+                    cells = [str(ws.cell_value(row_num, col)) for col in range(ws.ncols)]
+                    if any(c.strip() for c in cells):
+                        rows.append(" | ".join(cells))
+                if not rows:
+                    continue
+                content = f"Sheet: {ws.name}\n\n[TABLE]\n" + "\n".join(rows) + "\n[/TABLE]"
+                docs.append(Document(
+                    page_content=content,
+                    metadata={
+                        "source": filename, "page": sheet_idx + 1,
+                        "file_type": "xls", "sheet_name": ws.name,
+                        "row_count": len(rows),
+                    },
+                ))
+        except Exception as exc:
+            logger.error("Failed to load %s: %s", filename, exc)
+
+    logger.info("Loaded %d .xls sheets from %s", len(docs), doc_source)
+    return docs
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  11. PowerPoint (.pptx) loader
+# ─────────────────────────────────────────────────────────────────────
+
+
+def load_pptx(doc_source: str) -> list[Document]:
+    """Load .pptx files — extracts slide text, notes, and table content."""
+    try:
+        from pptx import Presentation
+    except ImportError:
+        logger.warning("python-pptx not installed — skipping .pptx files. Run: pip install python-pptx")
+        return []
+
+    docs: list[Document] = []
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".pptx"}):
+        try:
+            prs = Presentation(io.BytesIO(file_bytes))
+            slide_count = len(prs.slides)
+            for slide_num, slide in enumerate(prs.slides, start=1):
+                parts: list[str] = []
+                for shape in slide.shapes:
+                    if shape.has_text_frame:
+                        text = shape.text_frame.text.strip()
+                        if text:
+                            parts.append(text)
+                    if shape.has_table:
+                        table_rows: list[str] = []
+                        for row in shape.table.rows:
+                            cells = [cell.text.strip() for cell in row.cells]
+                            table_rows.append(" | ".join(cells))
+                        if table_rows:
+                            parts.append("\n[TABLE]\n" + "\n".join(table_rows) + "\n[/TABLE]")
+                # Slide notes
+                if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                    notes = slide.notes_slide.notes_text_frame.text.strip()
+                    if notes:
+                        parts.append(f"[NOTES]\n{notes}\n[/NOTES]")
+                content = "\n\n".join(parts)
+                if not content.strip():
+                    continue
+                docs.append(Document(
+                    page_content=content,
+                    metadata={
+                        "source": filename, "page": slide_num,
+                        "file_type": "pptx", "slide_count": slide_count,
+                    },
+                ))
+        except Exception as exc:
+            logger.error("Failed to load %s: %s", filename, exc)
+
+    logger.info("Loaded %d .pptx slides from %s", len(docs), doc_source)
+    return docs
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  12. Markdown (.md) loader
+# ─────────────────────────────────────────────────────────────────────
+
+
+def load_markdown(doc_source: str) -> list[Document]:
+    """Load .md Markdown files as plain text."""
+    docs: list[Document] = []
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".md"}):
+        content = file_bytes.decode("utf-8", errors="replace")
+        if not content.strip():
+            continue
+        docs.append(Document(
+            page_content=content,
+            metadata={"source": filename, "page": 1, "file_type": "markdown"},
+        ))
+    logger.info("Loaded %d .md files from %s", len(docs), doc_source)
+    return docs
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  13. Rich Text Format (.rtf) loader
+# ─────────────────────────────────────────────────────────────────────
+
+
+def load_rtf(doc_source: str) -> list[Document]:
+    """Load .rtf files — strips RTF formatting to extract plain text."""
+    try:
+        from striprtf.striprtf import rtf_to_text
+    except ImportError:
+        logger.warning("striprtf not installed — skipping .rtf files. Run: pip install striprtf")
+        return []
+
+    docs: list[Document] = []
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".rtf"}):
+        try:
+            raw = file_bytes.decode("utf-8", errors="replace")
+            content = rtf_to_text(raw)
+            if not content.strip():
+                continue
+            docs.append(Document(
+                page_content=content,
+                metadata={"source": filename, "page": 1, "file_type": "rtf"},
+            ))
+        except Exception as exc:
+            logger.error("Failed to load %s: %s", filename, exc)
+
+    logger.info("Loaded %d .rtf files from %s", len(docs), doc_source)
+    return docs
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  14. Legacy Word binary (.doc) loader — best-effort
+# ─────────────────────────────────────────────────────────────────────
+
+
+def load_doc(doc_source: str) -> list[Document]:
+    """Load .doc files via olefile — best-effort text extraction.
+
+    Legacy .doc format has no reliable pure-python parser.  This extracts
+    the raw text stream from the OLE container.  For full fidelity,
+    convert .doc to .docx first.
+    """
+    try:
+        import olefile
+    except ImportError:
+        logger.warning(
+            "olefile not installed — skipping .doc files. "
+            "Run: pip install olefile  (or convert .doc to .docx for best results)"
+        )
+        return []
+
+    docs: list[Document] = []
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".doc"}):
+        try:
+            ole = olefile.OleFileIO(io.BytesIO(file_bytes))
+            if ole.exists("WordDocument"):
+                stream = ole.openstream("WordDocument").read()
+                text = stream.decode("utf-8", errors="ignore")
+                text = re.sub(r"[^\x20-\x7E\n\r\t]", "", text)
+                text = re.sub(r"\n{3,}", "\n\n", text).strip()
+                if text and len(text) > 20:
+                    docs.append(Document(
+                        page_content=text,
+                        metadata={"source": filename, "page": 1, "file_type": "doc"},
+                    ))
+                else:
+                    logger.warning("Minimal text extracted from %s — consider converting to .docx", filename)
+            else:
+                logger.warning("No WordDocument stream in %s — cannot extract text", filename)
+            ole.close()
+        except Exception as exc:
+            logger.error("Failed to load %s: %s", filename, exc)
+
+    logger.info("Loaded %d .doc files from %s", len(docs), doc_source)
+    return docs
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  15. XML document loader
+# ─────────────────────────────────────────────────────────────────────
+
+
+def load_xml(doc_source: str) -> list[Document]:
+    """Load .xml files — extracts all text content from elements."""
+    import xml.etree.ElementTree as ET
+
+    docs: list[Document] = []
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".xml"}):
+        try:
+            tree = ET.parse(io.BytesIO(file_bytes))
+            root = tree.getroot()
+            root_tag = root.tag.split("}")[-1] if "}" in root.tag else root.tag
+            texts: list[str] = []
+            for elem in root.iter():
+                if elem.text and elem.text.strip():
+                    tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+                    texts.append(f"{tag}: {elem.text.strip()}")
+                if elem.tail and elem.tail.strip():
+                    texts.append(elem.tail.strip())
+            content = "\n".join(texts)
+            if not content.strip():
+                continue
+            docs.append(Document(
+                page_content=content,
+                metadata={
+                    "source": filename, "page": 1,
+                    "file_type": "xml", "root_tag": root_tag,
+                },
+            ))
+        except Exception as exc:
+            logger.error("Failed to load %s: %s", filename, exc)
+
+    logger.info("Loaded %d .xml files from %s", len(docs), doc_source)
+    return docs
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  16. Generic CSV loader (non-Purview)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def load_generic_csv(doc_source: str) -> list[Document]:
+    """Load generic .csv files as tabular data.
+
+    Purview Items_*.csv files are handled by load_purview_csv and skipped here.
+    Rows are batched into groups of _CSV_BATCH_SIZE to create manageable chunks.
+    """
+    import csv as _csv
+
+    docs: list[Document] = []
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".csv"}):
+        if filename.lower().startswith("items"):
+            continue
+        try:
+            text_data = file_bytes.decode("utf-8-sig", errors="replace")
+            reader = _csv.reader(io.StringIO(text_data))
+            all_rows = list(reader)
+            if not all_rows:
+                continue
+            header = all_rows[0]
+            header_line = " | ".join(header)
+            data_rows = all_rows[1:]
+            total_rows = len(data_rows)
+
+            for batch_idx in range(0, max(len(data_rows), 1), _CSV_BATCH_SIZE):
+                batch = data_rows[batch_idx: batch_idx + _CSV_BATCH_SIZE]
+                if not batch:
+                    continue
+                row_lines = [" | ".join(r) for r in batch]
+                content = f"[TABLE]\n{header_line}\n" + "\n".join(row_lines) + "\n[/TABLE]"
+                docs.append(Document(
+                    page_content=content,
+                    metadata={
+                        "source": filename,
+                        "page": (batch_idx // _CSV_BATCH_SIZE) + 1,
+                        "file_type": "csv",
+                        "row_count": total_rows,
+                    },
+                ))
+        except Exception as exc:
+            logger.error("Failed to load %s: %s", filename, exc)
+
+    logger.info("Loaded %d generic CSV chunks from %s", len(docs), doc_source)
+    return docs
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  17. Tab-separated values (.tsv) loader
+# ─────────────────────────────────────────────────────────────────────
+
+
+def load_tsv(doc_source: str) -> list[Document]:
+    """Load .tsv files as tabular data with the same batching as CSV."""
+    import csv as _csv
+
+    docs: list[Document] = []
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".tsv"}):
+        try:
+            text_data = file_bytes.decode("utf-8-sig", errors="replace")
+            reader = _csv.reader(io.StringIO(text_data), delimiter="\t")
+            all_rows = list(reader)
+            if not all_rows:
+                continue
+            header = all_rows[0]
+            header_line = " | ".join(header)
+            data_rows = all_rows[1:]
+            total_rows = len(data_rows)
+
+            for batch_idx in range(0, max(len(data_rows), 1), _CSV_BATCH_SIZE):
+                batch = data_rows[batch_idx: batch_idx + _CSV_BATCH_SIZE]
+                if not batch:
+                    continue
+                row_lines = [" | ".join(r) for r in batch]
+                content = f"[TABLE]\n{header_line}\n" + "\n".join(row_lines) + "\n[/TABLE]"
+                docs.append(Document(
+                    page_content=content,
+                    metadata={
+                        "source": filename,
+                        "page": (batch_idx // _CSV_BATCH_SIZE) + 1,
+                        "file_type": "tsv",
+                        "row_count": total_rows,
+                    },
+                ))
+        except Exception as exc:
+            logger.error("Failed to load %s: %s", filename, exc)
+
+    logger.info("Loaded %d .tsv chunks from %s", len(docs), doc_source)
+    return docs
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  18. Log file (.log) loader
+# ─────────────────────────────────────────────────────────────────────
+
+
+def load_logs(doc_source: str) -> list[Document]:
+    """Load .log files as plain text."""
+    docs: list[Document] = []
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".log"}):
+        content = file_bytes.decode("utf-8", errors="replace")
+        if not content.strip():
+            continue
+        docs.append(Document(
+            page_content=content,
+            metadata={"source": filename, "page": 1, "file_type": "log"},
+        ))
+    logger.info("Loaded %d .log files from %s", len(docs), doc_source)
+    return docs
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  19. ZIP archive loader (recursive extraction with safety guards)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def load_zip(doc_source: str) -> list[Document]:
+    """Load .zip files by extracting contents and recursively loading.
+
+    Safety guards: max nesting depth, max total bytes, max file count,
+    path traversal rejection.
+    """
+    import shutil
+    import zipfile
+
+    global _zip_current_depth
+    if _zip_current_depth >= _ZIP_MAX_NESTING_DEPTH:
+        logger.warning("ZIP nesting depth %d exceeds limit %d — skipping", _zip_current_depth, _ZIP_MAX_NESTING_DEPTH)
+        return []
+
+    docs: list[Document] = []
+    for filename, file_bytes in iter_files_for_source(doc_source, extensions={".zip"}):
+        tmp_dir = None
+        try:
+            bio = io.BytesIO(file_bytes)
+            if not zipfile.is_zipfile(bio):
+                logger.warning("Not a valid ZIP file: %s", filename)
+                continue
+
+            bio.seek(0)
+            zf = zipfile.ZipFile(bio)
+
+            # Safety: check file count
+            if len(zf.namelist()) > _ZIP_MAX_FILE_COUNT:
+                logger.warning("ZIP %s contains %d files (limit %d) — skipping",
+                               filename, len(zf.namelist()), _ZIP_MAX_FILE_COUNT)
+                zf.close()
+                continue
+
+            # Safety: check total uncompressed size
+            total_size = sum(info.file_size for info in zf.infolist())
+            if total_size > _ZIP_MAX_TOTAL_BYTES:
+                logger.warning("ZIP %s uncompressed size %.1f MB exceeds limit — skipping",
+                               filename, total_size / 1024 / 1024)
+                zf.close()
+                continue
+
+            # Safety: check for path traversal
+            bad_path = False
+            for name in zf.namelist():
+                if ".." in name or name.startswith("/") or name.startswith("\\"):
+                    logger.warning("ZIP %s contains suspicious path '%s' — skipping archive", filename, name)
+                    bad_path = True
+                    break
+            if bad_path:
+                zf.close()
+                continue
+
+            tmp_dir = tempfile.mkdtemp(prefix="rag_zip_")
+            zf.extractall(tmp_dir)
+            zf.close()
+
+            # Recursively load extracted files
+            _zip_current_depth += 1
+            try:
+                inner_docs = load_documents(tmp_dir)
+            finally:
+                _zip_current_depth -= 1
+
+            for doc in inner_docs:
+                doc.metadata["archive_source"] = filename
+                doc.metadata["source"] = f"{filename}::{doc.metadata.get('source', 'unknown')}"
+
+            docs.extend(inner_docs)
+            logger.info("Extracted %d documents from ZIP %s", len(inner_docs), filename)
+
+        except Exception as exc:
+            logger.error("Failed to process ZIP %s: %s", filename, exc)
+        finally:
+            if tmp_dir and os.path.isdir(tmp_dir):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    logger.info("Loaded %d documents from .zip archives in %s", len(docs), doc_source)
+    return docs
+
+
 _PURVIEW_KEY_FIELDS = [
     "Subject/Title", "Sender/Author", "To", "CC", "BCC",
     "Date", "Participants", "Conversation topic", "Themes list",
@@ -925,8 +1519,9 @@ def load_purview_csv(doc_source: str) -> list[Document]:
 def load_documents(doc_source: str) -> list[Document]:
     """Load all supported file types from a local directory or blob prefix.
 
-    Supported: .txt, .pdf, .docx, .png/.jpg/.tiff/.bmp (OCR),
-               .eml, .msg, .pst, .json/.csv (Purview eDiscovery)
+    Supported: .txt, .pdf, .docx, .xlsx, .xls, .pptx, .md, .rtf, .doc,
+               .xml, .csv, .tsv, .log, .json, .html/.htm,
+               .png/.jpg/.tiff/.bmp (OCR), .eml, .msg, .pst, .zip
     """
     docs: list[Document] = []
     file_counts: dict[str, int] = {}
@@ -937,12 +1532,25 @@ def load_documents(doc_source: str) -> list[Document]:
         ("txt",    load_texts),
         ("pdf",    load_pdfs),
         ("docx",   load_docx),
+        ("xlsx",   load_xlsx),
+        ("xls",    load_xls),
+        ("pptx",   load_pptx),
+        ("markdown", load_markdown),
+        ("rtf",    load_rtf),
+        ("doc",    load_doc),
+        ("xml",    load_xml),
+        ("generic-csv", load_generic_csv),
+        ("tsv",    load_tsv),
+        ("log",    load_logs),
+        ("json",   load_generic_json),
+        ("html",   load_html),
         ("images", load_images),
         ("eml",    load_eml),
         ("msg",    load_msg),
         ("pst",    load_pst),
         ("purview-json", load_purview_json),
         ("purview-csv",  load_purview_csv),
+        ("zip",    load_zip),
     ]:
         loaded = loader(doc_source)
         if loaded:
@@ -1138,6 +1746,35 @@ def ingest(
         logger.warning("[report] Failed files: %s", [f["file"] for f in report.failed_files])
 
     return inserted, report
+
+
+def ingest_case(case_id: str, source_path: str) -> dict:
+    """Convenience wrapper for job_queue — ingest by case_id + source_path.
+
+    Resolves doc_type / entity_name from the case config, calls ``ingest()``,
+    and returns a JSON-serialisable dict suitable as a job result.
+    """
+    doc_type = None
+    entity_name = None
+    try:
+        from app.cases import get_case
+        cfg = get_case(case_id)
+        doc_type = cfg.doc_type
+        entity_name = cfg.entity_name
+    except (KeyError, Exception):
+        pass
+
+    count, report = ingest(
+        source_path, case_id=case_id,
+        doc_type=doc_type, entity_name=entity_name,
+    )
+    return {
+        "case_id": case_id,
+        "chunks_inserted": count,
+        "summary": report.summary(),
+        "files_failed": report.files_failed,
+        "failed_files": report.failed_files,
+    }
 
 
 def main() -> None:

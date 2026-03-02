@@ -59,15 +59,15 @@ def intent_router_node(state: AgentState) -> dict:
     from app.intent_router import route_query
     query = state.get("rewritten_query") or state["query"]
     try:
-        result = route_query(query)
+        intent_result, _params = route_query(query)
         logger.info(
             "Intent router — intent=%s confidence=%.2f",
-            result.get("intent", "unknown"),
-            result.get("confidence", 0.0),
+            intent_result.intent,
+            intent_result.confidence,
         )
         return {
-            "intent": result.get("intent", "fact_lookup"),
-            "intent_confidence": result.get("confidence", 0.0),
+            "intent": intent_result.intent,
+            "intent_confidence": intent_result.confidence,
         }
     except Exception as exc:
         logger.warning("Intent routing failed: %s", exc)

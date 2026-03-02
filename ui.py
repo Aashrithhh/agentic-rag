@@ -6,6 +6,7 @@ Launch:
 
 from __future__ import annotations
 
+import threading
 import time
 import logging
 import shlex
@@ -81,8 +82,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 # ── Auto-ingest disabled (large blob cases block the UI) ────────────
-# Data is already ingested – use CLI for manual ingestion if needed:
-#   python -m app.ingest --case <case_id>
+# Ingestion is now handled via the Data Management tab below.
 if "auto_ingested" not in st.session_state:
     st.session_state["auto_ingested"] = True
 
@@ -344,6 +344,35 @@ with st.sidebar:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Ingestion helpers (threaded background ingestion for Streamlit)
+# ─────────────────────────────────────────────────────────────────────
+
+def _get_chunk_count(case_id: str) -> int:
+    """Return number of chunks in a case's database."""
+    try:
+        from sqlalchemy import text, select, func
+        eng = init_db(case_id)
+        from app.db import document_chunks
+        with eng.connect() as conn:
+            return conn.execute(
+                select(func.count()).select_from(document_chunks)
+            ).scalar() or 0
+    except Exception:
+        return 0
+
+
+def _run_ingest_thread(case_id: str, source_path: str, result_key: str) -> None:
+    """Run ingestion in a background thread so Streamlit doesn't freeze."""
+    try:
+        from app.ingest import ingest_case
+        st.session_state[result_key] = {"status": "running", "message": "Ingestion in progress..."}
+        result = ingest_case(case_id, source_path)
+        st.session_state[result_key] = {"status": "completed", "result": result}
+    except Exception as exc:
+        st.session_state[result_key] = {"status": "failed", "error": str(exc)}
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────
 
@@ -411,151 +440,311 @@ def render_step_card(node: str, data: dict[str, Any], css_class: str = "done"):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Main query area
+# Tabbed layout — Query | Data Management
 # ─────────────────────────────────────────────────────────────────────
-# Handle prefill from sample-question buttons (must happen BEFORE the widget)
-if "prefill_query" in st.session_state:
-    st.session_state["query_text"] = st.session_state.pop("prefill_query")
+tab_query, tab_ingest = st.tabs(["🔎 Query Pipeline", "📦 Data Management"])
 
-query = st.text_area(
-    "🔎 Enter your compliance / audit question",
-    key="query_text",
-    height=90,
-    placeholder="e.g. What were the issues with the Indian workers at Big Thorium?",
-)
 
-col_run, col_clear = st.columns([1, 5])
-with col_run:
-    run_clicked = st.button("▶  Run Query", type="primary", use_container_width=True)
-with col_clear:
-    if st.button("🗑  Clear history"):
-        st.session_state.pop("steps", None)
-        st.session_state.pop("final_answer", None)
-        st.rerun()
+# ═════════════════════════════════════════════════════════════════════
+# TAB 1: QUERY PIPELINE
+# ═════════════════════════════════════════════════════════════════════
+with tab_query:
+    # Handle prefill from sample-question buttons (must happen BEFORE the widget)
+    if "prefill_query" in st.session_state:
+        st.session_state["query_text"] = st.session_state.pop("prefill_query")
 
-# ─────────────────────────────────────────────────────────────────────
-# Execute pipeline
-# ─────────────────────────────────────────────────────────────────────
-if run_clicked and query.strip():
-    # ── Input validation ───────────────────────────────────────
-    if len(query.strip()) > settings.ui_max_query_length:
-        st.error(f"Query too long ({len(query.strip())} chars). Max is {settings.ui_max_query_length}.")
-        st.stop()
+    query = st.text_area(
+        "🔎 Enter your compliance / audit question",
+        key="query_text",
+        height=90,
+        placeholder="e.g. What were the issues with the Indian workers at Big Thorium?",
+    )
 
-    # Ensure the per-case database is ready
-    init_db(selected_case.case_id)
+    col_run, col_clear = st.columns([1, 5])
+    with col_run:
+        run_clicked = st.button("▶  Run Query", type="primary", use_container_width=True)
+    with col_clear:
+        if st.button("🗑  Clear history"):
+            st.session_state.pop("steps", None)
+            st.session_state.pop("final_answer", None)
+            st.rerun()
 
-    # Build initial state with case-level isolation
-    initial_state: AgentState = {
-        "query": query.strip(),
-        "loop_count": 0,
-        "case_id": selected_case.case_id,
-    }
+    # ─────────────────────────────────────────────────────────────────────
+    # Execute pipeline
+    # ─────────────────────────────────────────────────────────────────────
+    if run_clicked and query.strip():
+        # ── Input validation ───────────────────────────────────────
+        if len(query.strip()) > settings.ui_max_query_length:
+            st.error(f"Query too long ({len(query.strip())} chars). Max is {settings.ui_max_query_length}.")
+            st.stop()
 
-    agent = compile_graph()
+        # Ensure the per-case database is ready
+        init_db(selected_case.case_id)
 
-    steps: list[tuple[str, dict]] = []
-    final_state: dict = {}
+        # Build initial state with case-level isolation
+        initial_state: AgentState = {
+            "query": query.strip(),
+            "loop_count": 0,
+            "case_id": selected_case.case_id,
+        }
 
-    # ── Streaming execution with live progress ──
-    pipeline_container = st.container()
-    progress_bar = st.progress(0, text="Starting pipeline...")
-    status_placeholder = st.empty()
+        agent = compile_graph()
 
-    step_count = 0
-    t_start = time.time()
+        steps: list[tuple[str, dict]] = []
+        final_state: dict = {}
 
-    for step in agent.stream(initial_state):
-        node_name = list(step.keys())[0]
-        node_output = step[node_name]
-        steps.append((node_name, node_output))
-        final_state.update(node_output)
-        step_count += 1
+        # ── Streaming execution with live progress ──
+        pipeline_container = st.container()
+        progress_bar = st.progress(0, text="Starting pipeline...")
+        status_placeholder = st.empty()
 
-        # Update progress (estimate ~5 steps typical)
-        progress_bar.progress(
-            min(step_count / 5, 0.95),
-            text=f"Running **{NODE_META.get(node_name, {}).get('label', node_name)}**..."
-        )
+        step_count = 0
+        t_start = time.time()
 
-    elapsed = time.time() - t_start
-    progress_bar.progress(1.0, text="Pipeline complete!")
-    time.sleep(0.3)
-    progress_bar.empty()
+        for step in agent.stream(initial_state):
+            node_name = list(step.keys())[0]
+            node_output = step[node_name]
+            steps.append((node_name, node_output))
+            final_state.update(node_output)
+            step_count += 1
 
-    # Store in session
-    st.session_state["steps"] = steps
-    st.session_state["final_answer"] = final_state.get("answer", "")
-    st.session_state["elapsed"] = elapsed
-    st.session_state["final_state"] = final_state
+            # Update progress (estimate ~5 steps typical)
+            progress_bar.progress(
+                min(step_count / 5, 0.95),
+                text=f"Running **{NODE_META.get(node_name, {}).get('label', node_name)}**..."
+            )
 
-# ─────────────────────────────────────────────────────────────────────
-# Display results
-# ─────────────────────────────────────────────────────────────────────
-if "steps" in st.session_state:
-    steps = st.session_state["steps"]
-    final_state = st.session_state.get("final_state", {})
-    elapsed = st.session_state.get("elapsed", 0)
+        elapsed = time.time() - t_start
+        progress_bar.progress(1.0, text="Pipeline complete!")
+        time.sleep(0.3)
+        progress_bar.empty()
 
-    # ── Metrics row ──
-    n_docs = len(final_state.get("retrieved_docs", []))
-    score = final_state.get("grader_score", "?")
-    v_status = final_state.get("validation_status", "?")
-    loops = final_state.get("loop_count", 0)
-    answer_len = len(final_state.get("answer", ""))
+        # Store in session
+        st.session_state["steps"] = steps
+        st.session_state["final_answer"] = final_state.get("answer", "")
+        st.session_state["elapsed"] = elapsed
+        st.session_state["final_state"] = final_state
 
-    st.markdown(f"""
-    <div class="metric-row">
-        <span class="metric-pill">📥 {n_docs} docs retrieved</span>
-        <span class="metric-pill">⚖️ Grader: {score.upper()}</span>
-        <span class="metric-pill">🛡️ Validation: {v_status.upper()}</span>
-        <span class="metric-pill">🔄 Rewrites: {loops}</span>
-        <span class="metric-pill">⏱️ {elapsed:.1f}s</span>
-        <span class="metric-pill">📏 {answer_len:,} chars</span>
-    </div>
-    """, unsafe_allow_html=True)
+    # ─────────────────────────────────────────────────────────────────────
+    # Display results
+    # ─────────────────────────────────────────────────────────────────────
+    if "steps" in st.session_state:
+        steps = st.session_state["steps"]
+        final_state = st.session_state.get("final_state", {})
+        elapsed = st.session_state.get("elapsed", 0)
 
-    # ── Two-column layout: pipeline steps + answer ──
-    col_pipeline, col_answer = st.columns([2, 3])
+        # ── Metrics row ──
+        n_docs = len(final_state.get("retrieved_docs", []))
+        score = final_state.get("grader_score", "?")
+        v_status = final_state.get("validation_status", "?")
+        loops = final_state.get("loop_count", 0)
+        answer_len = len(final_state.get("answer", ""))
 
-    with col_pipeline:
-        st.markdown("#### Pipeline Trace")
-        for node_name, node_data in steps:
-            render_step_card(node_name, {**final_state, **node_data})
+        st.markdown(f"""
+        <div class="metric-row">
+            <span class="metric-pill">📥 {n_docs} docs retrieved</span>
+            <span class="metric-pill">⚖️ Grader: {score.upper()}</span>
+            <span class="metric-pill">🛡️ Validation: {v_status.upper()}</span>
+            <span class="metric-pill">🔄 Rewrites: {loops}</span>
+            <span class="metric-pill">⏱️ {elapsed:.1f}s</span>
+            <span class="metric-pill">📏 {answer_len:,} chars</span>
+        </div>
+        """, unsafe_allow_html=True)
 
-    with col_answer:
-        st.markdown("#### Answer")
-        answer = st.session_state.get("final_answer", "")
-        if answer:
-            st.markdown(f'<div class="answer-box">', unsafe_allow_html=True)
-            st.markdown(answer)
-            st.markdown('</div>', unsafe_allow_html=True)
+        # ── Two-column layout: pipeline steps + answer ──
+        col_pipeline, col_answer = st.columns([2, 3])
 
-            # Validation warning
-            if final_state.get("validation_status") in ("partial", "fail"):
-                st.warning(
-                    f"Validation status: **{final_state['validation_status'].upper()}** "
-                    "— some claims could not be verified. See discrepancy notes above."
-                )
-        else:
-            st.info("No answer was generated.")
+        with col_pipeline:
+            st.markdown("#### Pipeline Trace")
+            for node_name, node_data in steps:
+                render_step_card(node_name, {**final_state, **node_data})
 
-    # ── Expandable: retrieved documents ──
-    with st.expander("📄 Retrieved Documents", expanded=False):
-        docs = final_state.get("retrieved_docs", [])
-        for i, doc in enumerate(docs, 1):
-            src = doc.metadata.get("source", "unknown")
-            page = doc.metadata.get("page", "?")
-            st.markdown(f"**Document {i}** — `{src}` (page {page})")
-            st.text(doc.page_content[:500])
-            st.markdown("---")
+        with col_answer:
+            st.markdown("#### Answer")
+            answer = st.session_state.get("final_answer", "")
+            if answer:
+                st.markdown(f'<div class="answer-box">', unsafe_allow_html=True)
+                st.markdown(answer)
+                st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── Expandable: validation details ──
-    v_results = final_state.get("validation_results", [])
-    if v_results:
-        with st.expander("🛡️ Validation Details", expanded=False):
-            for r in v_results:
-                icon = "✅" if r.get("is_valid") else "❌"
-                st.markdown(f"{icon} **Claim:** {r.get('claim', '?')}")
-                st.markdown(f"   Endpoint: `{r.get('endpoint', '?')}` — Valid: **{r.get('is_valid')}**")
+                # Validation warning
+                if final_state.get("validation_status") in ("partial", "fail"):
+                    st.warning(
+                        f"Validation status: **{final_state['validation_status'].upper()}** "
+                        "— some claims could not be verified. See discrepancy notes above."
+                    )
+            else:
+                st.info("No answer was generated.")
+
+        # ── Expandable: retrieved documents ──
+        with st.expander("📄 Retrieved Documents", expanded=False):
+            docs = final_state.get("retrieved_docs", [])
+            for i, doc in enumerate(docs, 1):
+                src = doc.metadata.get("source", "unknown")
+                page = doc.metadata.get("page", "?")
+                st.markdown(f"**Document {i}** — `{src}` (page {page})")
+                st.text(doc.page_content[:500])
                 st.markdown("---")
+
+        # ── Expandable: validation details ──
+        v_results = final_state.get("validation_results", [])
+        if v_results:
+            with st.expander("🛡️ Validation Details", expanded=False):
+                for r in v_results:
+                    icon = "✅" if r.get("is_valid") else "❌"
+                    st.markdown(f"{icon} **Claim:** {r.get('claim', '?')}")
+                    st.markdown(f"   Endpoint: `{r.get('endpoint', '?')}` — Valid: **{r.get('is_valid')}**")
+                    st.markdown("---")
+
+
+# ═════════════════════════════════════════════════════════════════════
+# TAB 2: DATA MANAGEMENT
+# ═════════════════════════════════════════════════════════════════════
+with tab_ingest:
+    st.markdown("### 📦 Data Ingestion & Management")
+    st.markdown(
+        "Manage document ingestion for each case. "
+        "Ingestion runs in the background — you can switch to the Query tab while it runs."
+    )
+
+    # ── Show case status overview ────────────────────────────────
+    st.markdown("#### Case Status")
+
+    all_cases = list_cases()
+    case_status_data = []
+    for c in all_cases:
+        chunks = _get_chunk_count(c.case_id)
+        case_status_data.append({
+            "Case": c.display_name,
+            "Case ID": c.case_id,
+            "Doc Type": c.doc_type,
+            "Chunks": chunks,
+            "Status": "✅ Ingested" if chunks > 0 else "⚠️ Empty",
+            "Source": c.blob_prefix or c.data_dir or "—",
+        })
+
+    st.dataframe(case_status_data, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # ── Ingest selected case ─────────────────────────────────────
+    st.markdown(f"#### Ingest: **{selected_case.display_name}**")
+
+    current_chunks = _get_chunk_count(selected_case.case_id)
+    if current_chunks > 0:
+        st.success(f"This case already has **{current_chunks}** chunks in the database.")
+
+    # Determine source
+    from app.blob_storage import is_blob_mode
+    blob_mode = is_blob_mode()
+
+    if blob_mode and selected_case.blob_prefix:
+        source_display = f"Azure Blob: `{selected_case.blob_prefix}`"
+        source_path = selected_case.blob_prefix
+    elif selected_case.data_dir:
+        source_display = f"Local: `{selected_case.data_dir}`"
+        source_path = selected_case.data_dir
+    else:
+        source_display = "No data source configured"
+        source_path = ""
+
+    st.info(f"**Source:** {source_display}", icon="☁️" if blob_mode else "📁")
+
+    # Custom source override
+    with st.expander("Custom source (advanced)", expanded=False):
+        custom_source = st.text_input(
+            "Override source path (blob prefix or local directory)",
+            value="",
+            key="custom_source_path",
+            placeholder="e.g. demo-pst or data/sample_corpus",
+        )
+        if custom_source.strip():
+            source_path = custom_source.strip()
+
+    # Ingestion state key
+    ingest_key = f"ingest_result_{selected_case.case_id}"
+
+    # ── Start / Status buttons ───────────────────────────────────
+    col_ingest, col_status = st.columns([1, 2])
+
+    with col_ingest:
+        ingest_disabled = not source_path
+        if st.button(
+            "▶ Start Ingestion",
+            type="primary",
+            use_container_width=True,
+            disabled=ingest_disabled,
+            key="btn_start_ingest",
+        ):
+            if source_path:
+                st.session_state[ingest_key] = {"status": "running", "message": "Starting ingestion..."}
+                t = threading.Thread(
+                    target=_run_ingest_thread,
+                    args=(selected_case.case_id, source_path, ingest_key),
+                    daemon=True,
+                )
+                t.start()
+                st.rerun()
+
+    with col_status:
+        if st.button("🔄 Refresh Status", use_container_width=True, key="btn_refresh_ingest"):
+            st.rerun()
+
+    # ── Show ingestion result / progress ─────────────────────────
+    ingest_state = st.session_state.get(ingest_key, None)
+
+    if ingest_state:
+        status = ingest_state.get("status", "unknown")
+
+        if status == "running":
+            st.warning("⏳ **Ingestion in progress…** Click **Refresh Status** to check for completion.", icon="⏳")
+
+        elif status == "completed":
+            result = ingest_state.get("result", {})
+            st.success(
+                f"✅ **Ingestion complete!**  \n"
+                f"- **Chunks inserted:** {result.get('chunks_inserted', '?')}  \n"
+                f"- **Summary:** {result.get('summary', 'N/A')}",
+                icon="✅",
+            )
+            if result.get("files_failed", 0) > 0:
+                st.warning(
+                    f"⚠️ {result['files_failed']} file(s) failed to load:  \n"
+                    + "\n".join(f"- {f['file']}: {f['error']}" for f in result.get("failed_files", []))
+                )
+
+        elif status == "failed":
+            st.error(f"❌ **Ingestion failed:** {ingest_state.get('error', 'Unknown error')}", icon="❌")
+
+    # ── CLI reference ────────────────────────────────────────────
+    st.markdown("---")
+    with st.expander("CLI Reference", expanded=False):
+        st.markdown(
+            f"""
+You can also run ingestion from the command line:
+
+```powershell
+# Ingest from blob storage
+python -m app.ingest --case {selected_case.case_id} --blob-prefix {selected_case.blob_prefix or 'YOUR-PREFIX'}
+
+# Ingest from local directory
+python -m app.ingest --case {selected_case.case_id} --dir {selected_case.data_dir or 'data/YOUR-FOLDER'}
+
+# Specify doc type explicitly
+python -m app.ingest --case {selected_case.case_id} --blob-prefix {selected_case.blob_prefix or 'PREFIX'} --doc-type {selected_case.doc_type}
+```
+
+**REST API** (requires API key):
+
+```bash
+# Submit async ingestion job
+curl -X POST http://localhost:8080/api/v1/jobs/submit \\
+  -H "X-API-Key: YOUR_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{{"job_type": "ingest", "case_id": "{selected_case.case_id}", "source_path": "{source_path}"}}'
+
+# Check job status
+curl http://localhost:8080/api/v1/jobs/JOB_ID -H "X-API-Key: YOUR_KEY"
+```
+"""
+        )

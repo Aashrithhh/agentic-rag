@@ -8,6 +8,8 @@ When no Azure config is present, falls back to local filesystem reading.
 from __future__ import annotations
 
 import logging
+import time
+from io import BytesIO
 from pathlib import Path
 from typing import Iterator
 
@@ -16,6 +18,12 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 _client: "BlobStorageClient | None" = None
+
+# Download configuration
+MAX_DOWNLOAD_RETRIES = 3
+RETRY_DELAY_SECONDS = 2
+CONNECTION_TIMEOUT = 60  # seconds
+READ_TIMEOUT = 300  # 5 minutes for large files
 
 
 def is_blob_mode() -> bool:
@@ -41,12 +49,22 @@ class BlobStorageClient:
         if self._container_client is not None:
             return
 
+        # Configure retry and timeout
+        from azure.core.pipeline.transport import RequestsTransport
+        from azure.storage.blob._shared.policies import StorageRetryPolicy
+
+        transport = RequestsTransport(
+            connection_timeout=CONNECTION_TIMEOUT,
+            read_timeout=READ_TIMEOUT,
+        )
+
         if settings.azure_storage_sas_url:
             # SAS URL authentication (container-level SAS token)
             from azure.storage.blob import ContainerClient
 
             self._container_client = ContainerClient.from_container_url(
-                settings.azure_storage_sas_url
+                settings.azure_storage_sas_url,
+                transport=transport,
             )
             logger.info(
                 "Connected to Azure Blob Storage via SAS URL: %s",
@@ -57,7 +75,8 @@ class BlobStorageClient:
             from azure.storage.blob import BlobServiceClient
 
             service = BlobServiceClient.from_connection_string(
-                settings.azure_storage_connection_string
+                settings.azure_storage_connection_string,
+                transport=transport,
             )
             self._container_client = service.get_container_client(
                 settings.azure_storage_container_name
@@ -83,10 +102,35 @@ class BlobStorageClient:
         return sorted(names)
 
     def download_blob(self, blob_name: str) -> bytes:
-        """Download a single blob as bytes."""
+        """Download a single blob as bytes with retry logic."""
         self._ensure_client()
         blob_client = self._container_client.get_blob_client(blob_name)
-        return blob_client.download_blob().readall()
+        
+        last_error = None
+        for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
+            try:
+                logger.debug("Download attempt %d/%d for: %s", attempt, MAX_DOWNLOAD_RETRIES, blob_name)
+                
+                # Use chunked download for better reliability
+                stream = BytesIO()
+                download_stream = blob_client.download_blob(
+                    max_concurrency=1,  # Serial download for stability
+                )
+                download_stream.readinto(stream)
+                return stream.getvalue()
+                
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "Download attempt %d failed for %s: %s", 
+                    attempt, blob_name, str(e)[:200]
+                )
+                if attempt < MAX_DOWNLOAD_RETRIES:
+                    time.sleep(RETRY_DELAY_SECONDS * attempt)  # Exponential backoff
+        
+        raise RuntimeError(
+            f"Failed to download blob '{blob_name}' after {MAX_DOWNLOAD_RETRIES} attempts: {last_error}"
+        )
 
     def iter_files(
         self, prefix: str, extensions: set[str] | None = None

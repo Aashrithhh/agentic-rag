@@ -52,10 +52,25 @@ logger = logging.getLogger(__name__)
 
 limiter = Limiter(key_func=get_remote_address, default_limits=[settings.api_rate_limit])
 
+# ── Lifespan (start/stop job queue) ──────────────────────────────────
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    """Start the async job queue on startup, stop on shutdown."""
+    from app.job_queue import job_queue, register_default_handlers
+    register_default_handlers(job_queue)
+    await job_queue.start()
+    logger.info("Job queue started")
+    yield
+    await job_queue.stop()
+    logger.info("Job queue stopped")
+
 app = FastAPI(
     title="Agentic RAG API",
     version="1.0.0",
     description="REST interface for the Self-Correction Audit Agent.",
+    lifespan=lifespan,
 )
 
 app.state.limiter = limiter
@@ -327,6 +342,53 @@ def get_job_status(request: Request, job_id: str, _key: str = Depends(require_ap
         raise HTTPException(status_code=404, detail="Job not found")
     return result
 
+@app.post("/api/v1/jobs/submit")
+@limiter.limit(settings.api_rate_limit)
+async def submit_job(request: Request, body: JobSubmitRequest, _key: str = Depends(require_api_key)):
+    """Submit a background job (ingest, evaluation, retention_check).
+
+    Returns immediately with a ``job_id`` that can be polled via
+    ``GET /api/v1/jobs/{job_id}``.
+    """
+    from app.job_queue import job_queue, JobPriority
+
+    valid_types = {"ingest", "evaluation", "retention_check"}
+    if body.job_type not in valid_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid job_type '{body.job_type}'. Must be one of: {', '.join(sorted(valid_types))}",
+        )
+
+    kwargs: dict[str, str] = {}
+    if body.job_type == "ingest":
+        if not body.case_id or not body.source_path:
+            raise HTTPException(status_code=400, detail="'case_id' and 'source_path' required for ingest jobs")
+        kwargs = {"case_id": body.case_id, "source_path": body.source_path}
+    elif body.job_type == "evaluation":
+        if not body.case_id or not body.eval_file:
+            raise HTTPException(status_code=400, detail="'case_id' and 'eval_file' required for evaluation jobs")
+        kwargs = {"case_id": body.case_id, "eval_file": body.eval_file}
+
+    job_id = await job_queue.submit(
+        name=body.job_type,
+        priority=JobPriority.NORMAL,
+        metadata={"submitted_via": "api"},
+        **kwargs,
+    )
+
+    logger.info("Job submitted via API: %s (type=%s, case=%s)", job_id, body.job_type, body.case_id)
+    return {"job_id": job_id, "job_type": body.job_type, "status": "pending"}
+
+
+@app.post("/api/v1/jobs/{job_id}/cancel")
+@limiter.limit(settings.api_rate_limit)
+def cancel_job(request: Request, job_id: str, _key: str = Depends(require_api_key)):
+    """Cancel a pending job."""
+    from app.job_queue import job_queue
+    success = job_queue.cancel_job(job_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="Job not found or already running/completed")
+    return {"job_id": job_id, "status": "cancelled"}
 
 # ── Data lifecycle endpoints ─────────────────────────────────────────
 

@@ -21,7 +21,8 @@ RULES:
 3. If validation status is "partial" or "fail", add a DISCREPANCY section.
 4. Structure your answer with clear headings.
 5. Think step-by-step through the compliance implications.
-6. If documents are insufficient, state what is missing.\
+6. If documents are insufficient, state what is missing.
+7. If CRITICAL FACT WARNINGS are present, add an "⚠️ INSUFFICIENT EVIDENCE" section listing each unsupported claim and why the evidence is weak. Do NOT present weakly-supported numeric values or dates as confirmed facts.\
 """
 
 _HUMAN = """\
@@ -29,6 +30,7 @@ _HUMAN = """\
 <documents>{documents}</documents>
 <validation_results>{validation_results}</validation_results>
 <validation_status>{validation_status}</validation_status>
+<critical_fact_warnings>{critical_fact_warnings}</critical_fact_warnings>
 Produce a comprehensive, cited answer.\
 """
 
@@ -42,6 +44,25 @@ def _format_validation_results(results: list[dict]) -> str:
     for r in results:
         icon = "✅" if r.get("is_valid") else "❌"
         lines.append(f"{icon} Claim: {r['claim']}\n   Endpoint: {r['endpoint']}\n   Valid: {r['is_valid']}")
+    return "\n".join(lines)
+
+
+def _format_critical_fact_warnings(assessments: list[dict]) -> str:
+    """Format critical fact assessments into a warning string for the generator."""
+    if not assessments:
+        return "No critical fact warnings."
+    weak = [a for a in assessments if not a["is_sufficiently_supported"]]
+    if not weak:
+        return "All critical facts have sufficient supporting evidence."
+    lines = ["⚠️ The following claims have INSUFFICIENT EVIDENCE:"]
+    for a in weak:
+        values = ", ".join(str(v) for v in a["critical_values"])
+        lines.append(
+            f"- Claim: {a['claim']}\n"
+            f"  Critical values: {values}\n"
+            f"  Supporting documents: {a['support_count']} (minimum required: {a['min_required']})\n"
+            f"  Sources found: {', '.join(a['supporting_sources']) or 'none'}"
+        )
     return "\n".join(lines)
 
 
@@ -63,11 +84,14 @@ def _generator_node_inner(state: AgentState) -> dict:
     v_results = state.get("validation_results", [])
     v_status = state.get("validation_status", "pass")
     case_id = state.get("case_id", "")
+    critical_assessments = state.get("critical_fact_assessments", [])
 
     doc_text = "\n---\n".join(
         f"[Source: {d.metadata.get('source', 'unknown')}, p.{d.metadata.get('page', '?')}]\n{d.page_content}"
         for d in docs
     )
+
+    critical_warnings = _format_critical_fact_warnings(critical_assessments)
 
     # ── Cache check ────────────────────────────────────────
     if settings.cache_llm_enabled:
@@ -77,6 +101,7 @@ def _generator_node_inner(state: AgentState) -> dict:
              "docs_digest": stable_hash(doc_text),
              "validation_results": v_results,
              "validation_status": v_status,
+             "critical_warnings": critical_warnings,
              "model": settings.openai_model},
             prefix=f"generator:{case_id}",
         )
@@ -97,7 +122,8 @@ def _generator_node_inner(state: AgentState) -> dict:
         chain,
         {"query": query, "documents": doc_text or "(No documents retrieved.)",
          "validation_results": _format_validation_results(v_results),
-         "validation_status": v_status},
+         "validation_status": v_status,
+         "critical_fact_warnings": critical_warnings},
         node_name="generator",
     )
 

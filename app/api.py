@@ -14,6 +14,9 @@ Endpoints:
     POST /api/v1/hitl/{id}/reject  — reject a HITL review
     GET  /api/v1/jobs             — list async jobs
     POST /api/v1/jobs/submit      — submit async job
+    POST /api/v1/feedback/retrieval — submit per-doc relevance flags
+    POST /api/v1/chats/save-local  — save chat + flags locally
+    GET  /api/v1/chats/local       — list saved chats for a case
 
 Run:
     uvicorn app.api:app --host 0.0.0.0 --port 8080
@@ -130,6 +133,12 @@ async def request_middleware(request: Request, call_next):
 class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=settings.ui_max_query_length)
     case_id: str = Field(..., min_length=1)
+    # ── Optional email metadata filters ──────────────────
+    email_from: str | None = Field(default=None, description="Filter by sender (partial match)")
+    email_to: str | None = Field(default=None, description="Filter by recipient (partial match)")
+    email_date_from: str | None = Field(default=None, description="Filter emails from this date (ISO format)")
+    email_date_to: str | None = Field(default=None, description="Filter emails up to this date (ISO format)")
+    source_file: str | None = Field(default=None, description="Filter by source filename (partial match)")
 
 
 class QueryResponse(BaseModel):
@@ -197,11 +206,26 @@ def run_query(request: Request, req: QueryRequest, _key: str = Depends(require_a
 
     init_db(req.case_id)
 
+    # ── Build metadata filter from email filter params ──────────
+    email_filters: dict[str, str] = {}
+    if req.email_from:
+        email_filters["email_from"] = req.email_from
+    if req.email_to:
+        email_filters["email_to"] = req.email_to
+    if req.email_date_from:
+        email_filters["email_date_from"] = req.email_date_from
+    if req.email_date_to:
+        email_filters["email_date_to"] = req.email_date_to
+    if req.source_file:
+        email_filters["source_file"] = req.source_file
+
     initial_state: AgentState = {
         "query": req.query,
         "loop_count": 0,
         "case_id": req.case_id,
     }
+    if email_filters:
+        initial_state["metadata_filter"] = email_filters
 
     agent = compile_graph()
 
@@ -429,3 +453,137 @@ def slo_report(request: Request, _key: str = Depends(require_api_key)):
             for v in report.violations
         ],
     }
+
+
+# ── Feedback & Chat archive endpoints ────────────────────────────────
+
+
+class FeedbackFlag(BaseModel):
+    document_source: str
+    document_page: int | str | None = None
+    flag: str = Field(..., pattern=r"^(yes|no)$")
+
+
+class FeedbackRequest(BaseModel):
+    case_id: str = Field(..., min_length=1, max_length=200)
+    session_id: str = Field(..., min_length=1, max_length=200)
+    query: str = Field(..., min_length=1, max_length=4000)
+    flags: list[FeedbackFlag] = Field(..., min_length=1)
+
+
+class SaveChatRequest(BaseModel):
+    case_id: str = Field(..., min_length=1, max_length=200)
+    session_id: str = Field(..., min_length=1, max_length=200)
+    query: str = Field(..., min_length=1, max_length=4000)
+    answer: str
+    retrieved_docs: list[dict] = Field(default_factory=list)
+    flags: list[dict] = Field(default_factory=list)
+    validation_status: str = "pass"
+    grader_score: str = ""
+    loop_count: int = 0
+
+
+@app.post("/api/v1/feedback/retrieval")
+@limiter.limit(settings.api_rate_limit)
+def submit_feedback(
+    request: Request,
+    body: FeedbackRequest,
+    _key: str = Depends(require_api_key),
+):
+    """Submit per-document yes/no relevance flags for a query session."""
+    from app.audit_log import audit_log
+    from app.feedback_models import RetrievalFeedback
+
+    feedback_records = [
+        RetrievalFeedback(
+            case_id=body.case_id,
+            session_id=body.session_id,
+            query=body.query,
+            document_source=f.document_source,
+            document_page=f.document_page,
+            flag=f.flag,
+        )
+        for f in body.flags
+    ]
+
+    audit_log.log_feedback_submitted(
+        case_id=body.case_id,
+        session_id=body.session_id,
+        num_flags=len(feedback_records),
+    )
+
+    return {
+        "status": "ok",
+        "feedback_count": len(feedback_records),
+        "feedback_ids": [fb.id for fb in feedback_records],
+    }
+
+
+@app.post("/api/v1/chats/save-local")
+@limiter.limit(settings.api_rate_limit)
+def save_chat_local_endpoint(
+    request: Request,
+    body: SaveChatRequest,
+    _key: str = Depends(require_api_key),
+):
+    """Save a complete chat session (query, answer, docs, flags) locally."""
+    from app.audit_log import audit_log
+    from app.chat_storage import save_chat_local
+    from app.feedback_models import ArchivedDocument, ChatArchive, RetrievalFeedback
+
+    archived_docs = [
+        ArchivedDocument(
+            source=d.get("source", "unknown"),
+            page=d.get("page"),
+            content_preview=(d.get("content_preview") or d.get("content", ""))[:1000],
+            flag=d.get("flag", "unflagged"),
+        )
+        for d in body.retrieved_docs
+    ]
+
+    flag_records = [
+        RetrievalFeedback(
+            case_id=body.case_id,
+            session_id=body.session_id,
+            query=body.query,
+            document_source=f.get("document_source", ""),
+            document_page=f.get("document_page"),
+            flag=f.get("flag", "no"),
+        )
+        for f in body.flags
+    ]
+
+    archive = ChatArchive(
+        case_id=body.case_id,
+        session_id=body.session_id,
+        query=body.query,
+        answer=body.answer,
+        retrieved_docs=archived_docs,
+        flags=flag_records,
+        validation_status=body.validation_status,
+        grader_score=body.grader_score,
+        loop_count=body.loop_count,
+    )
+
+    try:
+        chat_id = save_chat_local(archive)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    audit_log.log_chat_saved(case_id=body.case_id, chat_id=chat_id)
+
+    return {"status": "ok", "chat_id": chat_id}
+
+
+@app.get("/api/v1/chats/local")
+@limiter.limit(settings.api_rate_limit)
+def list_local_chats(
+    request: Request,
+    case_id: str,
+    _key: str = Depends(require_api_key),
+):
+    """List saved chat archives for a given case."""
+    from app.chat_storage import list_saved_chats
+
+    chats = list_saved_chats(case_id)
+    return {"case_id": case_id, "chats": chats}

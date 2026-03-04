@@ -6,16 +6,23 @@ to fact-check specific data-points. Uses parallel async httpx calls.
 Cache strategy (Option A): only the claim *extraction* step is cached
 (the LLM call).  API verification is always live because external data
 can change between requests.
+
+Critical Fact Protection (gated by ``critical_fact_protection`` flag):
+  For numeric/date claims, require at least N supporting spans in retrieved
+  documents. If support is weak, flag as "insufficient evidence" rather
+  than returning a confident answer.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Literal
 
 import httpx
 from langchain_openai import ChatOpenAI
+from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
@@ -24,6 +31,20 @@ from app.config import settings
 from app.state import AgentState, ValidationResult
 
 logger = logging.getLogger(__name__)
+
+# ── Regex for identifying critical facts (numeric values, dates, monetary) ──
+_CRITICAL_VALUE_RE = re.compile(
+    r'(?:'
+    r'\$[\d,]+(?:\.\d+)?'                          # monetary ($1,234.56)
+    r'|\d{1,3}(?:,\d{3})+(?:\.\d+)?'               # large numbers (1,234,567)
+    r'|\d+(?:\.\d+)?%'                              # percentages (12.5%)
+    r'|\d{4}[-/]\d{1,2}[-/]\d{1,2}'                 # dates (2024-01-15)
+    r'|\d{1,2}[-/]\d{1,2}[-/]\d{4}'                 # dates (01/15/2024)
+    r'|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2},?\s*\d{2,4}'
+    r'|\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{2,4}'
+    r')',
+    re.IGNORECASE,
+)
 
 
 class ExtractedClaim(BaseModel):
@@ -159,10 +180,108 @@ def _validator_node_inner(state: AgentState) -> dict:
             logger.debug("Validator extraction cache MISS — stored %d claims", len(claim_list.claims))
 
     if not claim_list.claims:
-        return {"validation_results": [], "validation_status": "pass"}
+        return {"validation_results": [], "validation_status": "pass",
+                "critical_fact_assessments": []}
 
     # API verification is always live (not cached)
     logger.info("Validator — verifying %d claims in parallel...", len(claim_list.claims))
     results = asyncio.run(_verify_all(claim_list.claims))
     status = _aggregate_status(results)
-    return {"validation_results": results, "validation_status": status}
+
+    # ── Critical fact protection ───────────────────────────
+    critical_assessments: list[dict] = []
+    if settings.critical_fact_protection:
+        critical_assessments = _check_critical_fact_support(
+            claim_list.claims, docs,
+        )
+        weak_facts = [a for a in critical_assessments if not a["is_sufficiently_supported"]]
+        if weak_facts:
+            logger.warning(
+                "Critical fact protection: %d/%d critical claims have insufficient evidence.",
+                len(weak_facts), len(critical_assessments),
+            )
+            # Downgrade status if critical facts lack evidence
+            if status == "pass" and weak_facts:
+                status = "partial"
+
+    return {
+        "validation_results": results,
+        "validation_status": status,
+        "critical_fact_assessments": critical_assessments,
+    }
+
+
+# ── Critical Fact Protection ─────────────────────────────────────────
+
+
+def _check_critical_fact_support(
+    claims: list[ExtractedClaim],
+    docs: list[Document],
+) -> list[dict]:
+    """Verify that numeric/date claims have at least N supporting spans.
+
+    For each claim containing critical values (numbers, dates, monetary
+    amounts), count how many distinct retrieved documents contain matching
+    values. If the count is below ``settings.critical_fact_min_spans``,
+    mark the claim as insufficiently supported.
+
+    Returns a list of assessments (only for claims with critical values).
+    """
+    assessments: list[dict] = []
+
+    for claim in claims:
+        # Extract critical values from the claim text
+        critical_values = _CRITICAL_VALUE_RE.findall(claim.claim)
+        if not critical_values:
+            continue
+
+        # Normalize values for comparison
+        normalized_values = [_normalize_value(v) for v in critical_values]
+
+        # Count distinct supporting documents
+        supporting_sources: list[str] = []
+        support_count = 0
+
+        for doc in docs:
+            content_lower = doc.page_content.lower()
+            content_normalized = re.sub(r'[,\s]+', '', content_lower)
+            source = doc.metadata.get("source", "unknown")
+
+            matched = False
+            for nv in normalized_values:
+                # Check both normalized and raw matching
+                if nv in content_normalized or nv in content_lower:
+                    matched = True
+                    break
+                # Also check the raw value
+                raw_lower = critical_values[normalized_values.index(nv)].lower()
+                if raw_lower in content_lower:
+                    matched = True
+                    break
+
+            if matched:
+                support_count += 1
+                supporting_sources.append(source)
+
+        is_supported = support_count >= settings.critical_fact_min_spans
+        assessments.append({
+            "claim": claim.claim,
+            "critical_values": critical_values,
+            "support_count": support_count,
+            "min_required": settings.critical_fact_min_spans,
+            "is_sufficiently_supported": is_supported,
+            "supporting_sources": supporting_sources,
+        })
+
+    return assessments
+
+
+def _normalize_value(value: str) -> str:
+    """Normalize a critical value for fuzzy matching.
+
+    Strips currency symbols, commas, whitespace to allow matching
+    "$1,234.56" against "1234.56" in document text.
+    """
+    v = value.lower().strip()
+    v = re.sub(r'[\$,\s]', '', v)
+    return v

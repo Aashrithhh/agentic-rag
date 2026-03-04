@@ -55,6 +55,17 @@ document_chunks = Table(
     Column("doc_type", String(64)),           # e.g. "10-K", "contract", "regulation"
     Column("entity_name", String(256)),       # company / counterparty name
     Column("effective_date", DateTime),
+    # ── Email-specific metadata columns ─────────────────────────
+    Column("message_id", String(512)),        # unique email Message-ID
+    Column("thread_id", String(512)),         # email thread/conversation ID
+    Column("email_subject", String(1024)),    # email subject line
+    Column("email_from", String(512)),        # sender
+    Column("email_to", String(1024)),         # recipients
+    Column("email_date", String(128)),        # email date string
+    Column("chunk_type", String(64)),         # heading, paragraph, email_header, etc.
+    Column("attachment_names", String(2048)), # comma-separated attachment filenames
+    Column("parent_message_id", String(512)), # for attachment chunks → links to parent
+    Column("total_chunks", Integer),          # total chunks from parent document
     Column("metadata_extra", JSONB, server_default=text("'{}'")),
     Column(
         "ts_content",                         # tsvector for BM25-style keyword search
@@ -77,6 +88,24 @@ gin_index = Index(
     "ix_chunks_ts_content_gin",
     document_chunks.c.ts_content,
     postgresql_using="gin",
+)
+
+# ── Index on message_id for neighbor stitching lookups ───────────────────
+msg_id_index = Index(
+    "ix_chunks_message_id",
+    document_chunks.c.message_id,
+)
+
+# ── Index on thread_id for thread-based retrieval ────────────────────────
+thread_id_index = Index(
+    "ix_chunks_thread_id",
+    document_chunks.c.thread_id,
+)
+
+# ── Index on parent_message_id for attachment linkage ────────────────────
+parent_msg_index = Index(
+    "ix_chunks_parent_message_id",
+    document_chunks.c.parent_message_id,
 )
 
 
@@ -198,7 +227,49 @@ def init_db(case_id: str) -> Engine:
             )
         )
     logger.info("Database '%s' initialised (pgvector HNSW + GIN indexes ready).", _case_db_name(case_id))
+
+    # ── Ensure email metadata columns exist (idempotent migration) ──
+    _ensure_email_columns(engine)
+
     return engine
+
+
+def _ensure_email_columns(engine: Engine) -> None:
+    """Add email metadata columns to existing tables (safe to re-run)."""
+    new_columns = [
+        ("message_id", "VARCHAR(512)"),
+        ("thread_id", "VARCHAR(512)"),
+        ("email_subject", "VARCHAR(1024)"),
+        ("email_from", "VARCHAR(512)"),
+        ("email_to", "VARCHAR(1024)"),
+        ("email_date", "VARCHAR(128)"),
+        ("chunk_type", "VARCHAR(64)"),
+        ("attachment_names", "VARCHAR(2048)"),
+        ("parent_message_id", "VARCHAR(512)"),
+        ("total_chunks", "INTEGER"),
+    ]
+    with engine.begin() as conn:
+        for col_name, col_type in new_columns:
+            try:
+                conn.execute(text(
+                    f"ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS "
+                    f"{col_name} {col_type}"
+                ))
+            except Exception:
+                pass  # Column already exists
+
+        # Create indexes if they don't exist
+        for idx_name, col_name in [
+            ("ix_chunks_message_id", "message_id"),
+            ("ix_chunks_thread_id", "thread_id"),
+            ("ix_chunks_parent_message_id", "parent_message_id"),
+        ]:
+            try:
+                conn.execute(text(
+                    f"CREATE INDEX IF NOT EXISTS {idx_name} ON document_chunks ({col_name})"
+                ))
+            except Exception:
+                pass
 
 
 def upsert_chunks(
@@ -235,20 +306,48 @@ def hybrid_search(
     where_clauses: list[Any] = []
     if metadata_filter:
         for col_name, value in metadata_filter.items():
-            col = document_chunks.c.get(col_name)
-            if col is not None:
-                where_clauses.append(col == value)
+            # Email-specific filters use ILIKE for partial matching
+            if col_name == "email_from":
+                where_clauses.append(document_chunks.c.email_from.ilike(f"%{value}%"))
+            elif col_name == "email_to":
+                where_clauses.append(document_chunks.c.email_to.ilike(f"%{value}%"))
+            elif col_name == "source_file":
+                where_clauses.append(document_chunks.c.source.ilike(f"%{value}%"))
+            elif col_name == "email_date_from":
+                where_clauses.append(document_chunks.c.email_date >= value)
+            elif col_name == "email_date_to":
+                where_clauses.append(document_chunks.c.email_date <= value)
+            else:
+                col = document_chunks.c.get(col_name)
+                if col is not None:
+                    where_clauses.append(col == value)
+
+    # Common columns for both queries
+    _common_cols = [
+        document_chunks.c.id,
+        document_chunks.c.content,
+        document_chunks.c.source,
+        document_chunks.c.page,
+        document_chunks.c.chunk_index,
+        document_chunks.c.doc_type,
+        document_chunks.c.entity_name,
+        document_chunks.c.message_id,
+        document_chunks.c.thread_id,
+        document_chunks.c.email_subject,
+        document_chunks.c.email_from,
+        document_chunks.c.email_to,
+        document_chunks.c.email_date,
+        document_chunks.c.chunk_type,
+        document_chunks.c.attachment_names,
+        document_chunks.c.parent_message_id,
+        document_chunks.c.total_chunks,
+        document_chunks.c.metadata_extra,
+    ]
 
     # 1) Semantic search via HNSW cosine distance
     sem_q = (
         select(
-            document_chunks.c.id,
-            document_chunks.c.content,
-            document_chunks.c.source,
-            document_chunks.c.page,
-            document_chunks.c.doc_type,
-            document_chunks.c.entity_name,
-            document_chunks.c.metadata_extra,
+            *_common_cols,
             (
                 1 - document_chunks.c.embedding.cosine_distance(query_embedding)
             ).label("sem_score"),
@@ -262,13 +361,7 @@ def hybrid_search(
     ts_query = func.websearch_to_tsquery("english", query_text)
     kw_q = (
         select(
-            document_chunks.c.id,
-            document_chunks.c.content,
-            document_chunks.c.source,
-            document_chunks.c.page,
-            document_chunks.c.doc_type,
-            document_chunks.c.entity_name,
-            document_chunks.c.metadata_extra,
+            *_common_cols,
             func.ts_rank_cd(document_chunks.c.ts_content, ts_query).label(
                 "kw_score"
             ),
@@ -301,3 +394,157 @@ def hybrid_search(
 
     sorted_ids = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)[:top_k]
     return [{**doc_map[rid], "rrf_score": rrf_scores[rid]} for rid in sorted_ids]
+
+
+# ── Neighbor Chunk Fetching (context stitching) ─────────────────────────
+
+
+def fetch_neighbor_chunks(
+    engine: Engine,
+    message_id: str,
+    chunk_index: int,
+    window: int = 1,
+) -> list[dict[str, Any]]:
+    """Fetch neighboring chunks (chunk_index ± window) for the same message_id.
+
+    Used for context stitching — when a chunk is retrieved, its
+    neighbors provide additional context from the same email/document.
+    """
+    if not message_id:
+        return []
+
+    neighbor_indices = list(range(
+        max(0, chunk_index - window),
+        chunk_index + window + 1,
+    ))
+    # Exclude the original chunk_index
+    neighbor_indices = [i for i in neighbor_indices if i != chunk_index]
+
+    if not neighbor_indices:
+        return []
+
+    q = (
+        select(
+            document_chunks.c.id,
+            document_chunks.c.content,
+            document_chunks.c.source,
+            document_chunks.c.page,
+            document_chunks.c.chunk_index,
+            document_chunks.c.doc_type,
+            document_chunks.c.entity_name,
+            document_chunks.c.message_id,
+            document_chunks.c.thread_id,
+            document_chunks.c.chunk_type,
+            document_chunks.c.metadata_extra,
+        )
+        .where(
+            document_chunks.c.message_id == message_id,
+            document_chunks.c.chunk_index.in_(neighbor_indices),
+        )
+        .order_by(document_chunks.c.chunk_index)
+    )
+
+    with engine.connect() as conn:
+        rows = conn.execute(q).mappings().all()
+
+    return [dict(row) for row in rows]
+
+
+def fetch_attachment_chunks(
+    engine: Engine,
+    message_id: str,
+    *,
+    top_k: int = 2,
+    query_embedding: list[float] | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch attachment chunks linked to a parent email via parent_message_id.
+
+    If ``query_embedding`` is provided, returns the top-k most relevant
+    attachment chunks by cosine similarity; otherwise returns the first
+    top-k by chunk_index.
+    """
+    if not message_id:
+        return []
+
+    if query_embedding is not None:
+        q = (
+            select(
+                document_chunks.c.id,
+                document_chunks.c.content,
+                document_chunks.c.source,
+                document_chunks.c.page,
+                document_chunks.c.chunk_index,
+                document_chunks.c.doc_type,
+                document_chunks.c.entity_name,
+                document_chunks.c.message_id,
+                document_chunks.c.parent_message_id,
+                document_chunks.c.chunk_type,
+                document_chunks.c.metadata_extra,
+                (1 - document_chunks.c.embedding.cosine_distance(query_embedding)).label("sem_score"),
+            )
+            .where(document_chunks.c.parent_message_id == message_id)
+            .order_by(document_chunks.c.embedding.cosine_distance(query_embedding))
+            .limit(top_k)
+        )
+    else:
+        q = (
+            select(
+                document_chunks.c.id,
+                document_chunks.c.content,
+                document_chunks.c.source,
+                document_chunks.c.page,
+                document_chunks.c.chunk_index,
+                document_chunks.c.doc_type,
+                document_chunks.c.entity_name,
+                document_chunks.c.message_id,
+                document_chunks.c.parent_message_id,
+                document_chunks.c.chunk_type,
+                document_chunks.c.metadata_extra,
+            )
+            .where(document_chunks.c.parent_message_id == message_id)
+            .order_by(document_chunks.c.chunk_index)
+            .limit(top_k)
+        )
+
+    with engine.connect() as conn:
+        rows = conn.execute(q).mappings().all()
+
+    return [dict(row) for row in rows]
+
+
+def fetch_parent_email_chunks(
+    engine: Engine,
+    parent_message_id: str,
+    *,
+    top_k: int = 2,
+) -> list[dict[str, Any]]:
+    """Fetch parent email chunks for an attachment chunk (reverse linkage).
+
+    When an attachment chunk is retrieved, this fetches the parent email
+    chunks for additional context.
+    """
+    if not parent_message_id:
+        return []
+
+    q = (
+        select(
+            document_chunks.c.id,
+            document_chunks.c.content,
+            document_chunks.c.source,
+            document_chunks.c.page,
+            document_chunks.c.chunk_index,
+            document_chunks.c.doc_type,
+            document_chunks.c.entity_name,
+            document_chunks.c.message_id,
+            document_chunks.c.chunk_type,
+            document_chunks.c.metadata_extra,
+        )
+        .where(document_chunks.c.message_id == parent_message_id)
+        .order_by(document_chunks.c.chunk_index)
+        .limit(top_k)
+    )
+
+    with engine.connect() as conn:
+        rows = conn.execute(q).mappings().all()
+
+    return [dict(row) for row in rows]

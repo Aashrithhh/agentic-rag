@@ -473,15 +473,17 @@ def load_images(doc_source: str) -> list[Document]:
 # ─────────────────────────────────────────────────────────────────────
 #  5. Email (.eml) loader
 # ─────────────────────────────────────────────────────────────────────
-def _extract_email_text(msg: email.message.EmailMessage) -> tuple[str, list[str]]:
+def _extract_email_text(msg: email.message.EmailMessage) -> tuple[str, list[str], list[tuple[str, str]]]:
     """Extract the plain-text body and process attachments from an email.
 
     Returns:
-        (full_text, attachment_names) where full_text includes any text
-        extracted from image/audio/PDF attachments.
+        (full_text, attachment_names, attachment_docs) where full_text includes any text
+        extracted from image/audio/PDF attachments, and attachment_docs is a list of
+        (filename, extracted_text) tuples for creating separate attachment Documents.
     """
     body_parts: list[str] = []
     attachment_names: list[str] = []
+    attachment_docs: list[tuple[str, str]] = []  # (filename, text)
 
     # Headers
     headers = []
@@ -506,6 +508,8 @@ def _extract_email_text(msg: email.message.EmailMessage) -> tuple[str, list[str]
                     att_text = _process_attachment(ct, payload, fn)
                     if att_text:
                         body_parts.append(att_text)
+                        # Also store for separate attachment Document
+                        attachment_docs.append((fn, att_text))
                 continue
 
             if ct == "text/plain":
@@ -527,18 +531,28 @@ def _extract_email_text(msg: email.message.EmailMessage) -> tuple[str, list[str]
         if payload:
             body_parts.append(payload.decode("utf-8", errors="replace"))
 
-    return "\n\n".join(body_parts), attachment_names
+    return "\n\n".join(body_parts), attachment_names, attachment_docs
 
 
 def load_eml(doc_source: str) -> list[Document]:
-    """Load .eml email files with full attachment processing."""
+    """Load .eml email files with full attachment processing.
+
+    Creates separate attachment Documents with ``parent_message_id`` set
+    so the retriever can link attachments back to parent emails.
+    """
     docs: list[Document] = []
     for filename, file_bytes in iter_files_for_source(doc_source, extensions={".eml"}):
         try:
             msg = email.message_from_bytes(file_bytes, policy=policy.default)
-            text, attachments = _extract_email_text(msg)
+            text, attachments, attachment_docs = _extract_email_text(msg)
             if not text.strip():
                 continue
+
+            message_id = msg.get("Message-ID", "") or ""
+            in_reply_to = msg.get("In-Reply-To", "") or ""
+            references = msg.get("References", "") or ""
+            thread_id = in_reply_to or (references.split()[0] if references.strip() else "")
+            clean_msg_id = message_id.strip("<>")
 
             docs.append(Document(
                 page_content=text,
@@ -548,9 +562,33 @@ def load_eml(doc_source: str) -> list[Document]:
                     "email_to": msg.get("To", ""),
                     "email_subject": msg.get("Subject", ""),
                     "email_date": msg.get("Date", ""),
+                    "message_id": clean_msg_id,
+                    "thread_id": thread_id.strip("<>"),
                     "attachments": ", ".join(attachments) if attachments else "",
+                    "attachment_names": ", ".join(attachments) if attachments else "",
                 },
             ))
+
+            # Create separate attachment Documents with parent_message_id linkage
+            if settings.attachment_context_link and attachment_docs:
+                for att_name, att_text in attachment_docs:
+                    docs.append(Document(
+                        page_content=att_text,
+                        metadata={
+                            "source": f"{filename}::{att_name}",
+                            "page": 1,
+                            "file_type": "attachment",
+                            "email_from": msg.get("From", ""),
+                            "email_to": msg.get("To", ""),
+                            "email_subject": msg.get("Subject", ""),
+                            "email_date": msg.get("Date", ""),
+                            "parent_message_id": clean_msg_id,
+                            "thread_id": thread_id.strip("<>"),
+                            "attachment_names": att_name,
+                        },
+                    ))
+                logger.info("Created %d separate attachment docs for %s",
+                            len(attachment_docs), filename)
         except Exception as exc:
             logger.error("Failed to load %s: %s", filename, exc)
 
@@ -775,6 +813,15 @@ def _extract_pst_folder(folder, pst_name: str, docs: list[Document], max_emails:
 
                     content = "\n".join(parts)
                     if content.strip():
+                        # Extract message identifiers for threading
+                        msg_id = ""
+                        conversation_id = ""
+                        try:
+                            msg_id = getattr(item, "EntryID", "") or ""
+                            conversation_id = getattr(item, "ConversationID", "") or getattr(item, "ConversationTopic", "") or ""
+                        except Exception:
+                            pass
+
                         docs.append(Document(
                             page_content=content,
                             metadata={
@@ -785,10 +832,37 @@ def _extract_pst_folder(folder, pst_name: str, docs: list[Document], max_emails:
                                 "email_to": getattr(item, "To", ""),
                                 "email_subject": getattr(item, "Subject", ""),
                                 "email_date": str(getattr(item, "ReceivedTime", "")),
+                                "message_id": msg_id,
+                                "thread_id": conversation_id,
                                 "folder": folder.Name,
                                 "attachments": ", ".join(att_names) if att_names else "",
+                                "attachment_names": ", ".join(att_names) if att_names else "",
                             },
                         ))
+
+                        # Create separate attachment Documents with parent_message_id
+                        if settings.attachment_context_link and att_names:
+                            for att_fn in att_names:
+                                # Find matching attachment text in parts
+                                att_marker = f"[ATTACHMENT: {att_fn}"
+                                for part in parts:
+                                    if att_marker in part:
+                                        docs.append(Document(
+                                            page_content=part,
+                                            metadata={
+                                                "source": f"{pst_name}::{att_fn}",
+                                                "page": i,
+                                                "file_type": "attachment",
+                                                "email_from": getattr(item, "SenderName", ""),
+                                                "email_to": getattr(item, "To", ""),
+                                                "email_subject": getattr(item, "Subject", ""),
+                                                "email_date": str(getattr(item, "ReceivedTime", "")),
+                                                "parent_message_id": msg_id,
+                                                "thread_id": conversation_id,
+                                                "attachment_names": att_fn,
+                                            },
+                                        ))
+                                        break
             except Exception:
                 continue
     except Exception:
@@ -1589,7 +1663,7 @@ def _get_embedding_model():
         return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 
-def embed_chunks(chunks: list[Document], batch_size: int = 48) -> list[dict]:
+def embed_chunks(chunks: list[Document], batch_size: int = 48, progress_cb=None) -> list[dict]:
     """Embed chunks in batches with rate-limit retry."""
     import time
 
@@ -1607,6 +1681,8 @@ def embed_chunks(chunks: list[Document], batch_size: int = 48) -> list[dict]:
                 embs = model.embed_documents(batch)
                 all_embeddings.extend(embs)
                 logger.info("Embedded batch %d/%d (%d chunks)", batch_num, total_batches, len(batch))
+                if progress_cb:
+                    progress_cb(batch_num, total_batches)
                 break
             except Exception as exc:
                 if "429" in str(exc) or "rate" in str(exc).lower():
@@ -1625,12 +1701,30 @@ def embed_chunks(chunks: list[Document], batch_size: int = 48) -> list[dict]:
     rows = []
     for chunk, emb in zip(chunks, all_embeddings):
         meta = chunk.metadata
+        # Separate known DB columns from extra metadata
+        _db_cols = {
+            "source", "page", "chunk_index", "doc_type", "entity_name",
+            "effective_date", "message_id", "thread_id", "email_subject",
+            "email_from", "email_to", "email_date", "chunk_type",
+            "attachment_names", "parent_message_id", "total_chunks",
+        }
         rows.append({
             "content": chunk.page_content, "embedding": emb,
             "source": meta.get("source", "unknown"), "page": meta.get("page"),
             "chunk_index": meta.get("chunk_index"), "doc_type": meta.get("doc_type"),
             "entity_name": meta.get("entity_name"), "effective_date": meta.get("effective_date"),
-            "metadata_extra": {k: v for k, v in meta.items() if k not in {"source", "page", "chunk_index", "doc_type", "entity_name", "effective_date"}},
+            # Email-specific metadata
+            "message_id": meta.get("message_id", ""),
+            "thread_id": meta.get("thread_id", ""),
+            "email_subject": meta.get("email_subject", ""),
+            "email_from": meta.get("email_from", ""),
+            "email_to": meta.get("email_to", ""),
+            "email_date": meta.get("email_date", ""),
+            "chunk_type": meta.get("chunk_type", ""),
+            "attachment_names": meta.get("attachment_names") or meta.get("attachments", ""),
+            "parent_message_id": meta.get("parent_message_id", ""),
+            "total_chunks": meta.get("total_chunks"),
+            "metadata_extra": {k: v for k, v in meta.items() if k not in _db_cols},
         })
     return rows
 
@@ -1641,12 +1735,17 @@ def ingest(
     case_id: str,
     doc_type: str | None = None,
     entity_name: str | None = None,
+    progress_cb=None,
 ) -> tuple[int, IngestionReport]:
     """Ingest documents into the **per-case** isolated database.
 
     ``doc_source`` is either a local directory path or a blob prefix
     (when Azure Blob Storage is configured).  ``case_id`` is mandatory
     — it determines which database receives the chunks.
+
+    ``progress_cb`` is an optional ``(pct: float, label: str) -> None``
+    callback invoked at each pipeline stage so callers (e.g. UI) can
+    display a live progress bar.
 
     Returns ``(chunks_inserted, report)`` where *report* tracks
     per-file success/failure for auditability.
@@ -1656,6 +1755,10 @@ def ingest(
     """
     from app.blob_storage import is_blob_mode
 
+    def _progress(pct: float, label: str) -> None:
+        if progress_cb:
+            progress_cb(pct, label)
+
     # ── Guardrail: reject non-blob sources when required ─────────
     if settings.require_blob_source and not is_blob_mode():
         raise RuntimeError(
@@ -1664,9 +1767,11 @@ def ingest(
             "AZURE_STORAGE_CONNECTION_STRING, or set REQUIRE_BLOB_SOURCE=false."
         )
 
+    _progress(0.02, "Initializing database...")
     engine = init_db(case_id)
 
     # ── Load ─────────────────────────────────────────────────────
+    _progress(0.05, "Loading documents...")
     report = IngestionReport()
     raw_docs = load_documents(doc_source)
     report.total_files_found = len(raw_docs)
@@ -1674,7 +1779,10 @@ def ingest(
     logger.info("[metrics] files_read=%d from source=%s", len(raw_docs), doc_source)
     if not raw_docs:
         logger.warning("No documents loaded from %s — nothing to ingest.", doc_source)
+        _progress(1.0, "No documents found")
         return 0, report
+
+    _progress(0.10, f"Loaded {len(raw_docs)} documents")
 
     if doc_type or entity_name:
         for d in raw_docs:
@@ -1682,6 +1790,7 @@ def ingest(
             if entity_name: d.metadata["entity_name"] = entity_name
 
     # ── Chunk ────────────────────────────────────────────────────
+    _progress(0.12, "Chunking documents...")
     if settings.use_structure_aware_chunking:
         from app.chunking import chunk_documents_structured
         chunks = chunk_documents_structured(raw_docs)
@@ -1694,9 +1803,11 @@ def ingest(
         len(raw_docs), len(chunks), skipped,
         settings.chunk_size, settings.chunk_overlap,
     )
+    _progress(0.15, f"Created {len(chunks)} chunks")
 
     # ── PII redaction (before embedding) ──────────────────────────
     if settings.pii_redaction_enabled:
+        _progress(0.16, "Running PII redaction...")
         from app.pii_redaction import redact_document_chunks
         chunks, pii_stats = redact_document_chunks(chunks, mode=settings.pii_redaction_mode)
         if pii_stats.get("total_detections", 0) > 0:
@@ -1716,14 +1827,23 @@ def ingest(
                 )
             except Exception:
                 pass
+    _progress(0.20, "Embedding chunks...")
 
     # ── Embed ─────────────────────────────────────────────────────
-    rows = embed_chunks(chunks)
+    def _embed_progress(batch_num: int, total_batches: int) -> None:
+        # Map batch progress into 0.20 → 0.70 range
+        pct = 0.20 + (batch_num / total_batches) * 0.50
+        _progress(pct, f"Embedding batch {batch_num}/{total_batches}...")
+
+    rows = embed_chunks(chunks, progress_cb=_embed_progress)
+    _progress(0.70, "Embedding complete")
 
     # ── Enrich (optional, LLM-based) ──────────────────────────────
     if settings.enable_metadata_enrichment:
+        _progress(0.72, "Enriching metadata...")
         from app.enrichment import enrich_chunks_batch
         rows = enrich_chunks_batch(rows, batch_size=settings.enrichment_batch_size)
+    _progress(0.85, "Storing chunks in database...")
 
     # ── Store ─────────────────────────────────────────────────────
     inserted = upsert_chunks(engine, rows)
@@ -1731,9 +1851,11 @@ def ingest(
         "[metrics] embeddings_written=%d  case=%s  source=%s",
         inserted, case_id, doc_source,
     )
+    _progress(0.93, f"Stored {inserted} chunks")
 
     # ── Invalidate retrieval cache for this case ──────────
     # New chunks change search results; embedding cache is safe to keep.
+    _progress(0.95, "Invalidating caches...")
     from app.cache import cache
     removed = cache.invalidate_case_retrieval_cache(case_id)
     if removed:
@@ -1745,10 +1867,11 @@ def ingest(
     if report.files_failed > 0:
         logger.warning("[report] Failed files: %s", [f["file"] for f in report.failed_files])
 
+    _progress(1.0, f"Ingestion complete — {inserted} chunks stored")
     return inserted, report
 
 
-def ingest_case(case_id: str, source_path: str) -> dict:
+def ingest_case(case_id: str, source_path: str, progress_cb=None) -> dict:
     """Convenience wrapper for job_queue — ingest by case_id + source_path.
 
     Resolves doc_type / entity_name from the case config, calls ``ingest()``,
@@ -1767,6 +1890,7 @@ def ingest_case(case_id: str, source_path: str) -> dict:
     count, report = ingest(
         source_path, case_id=case_id,
         doc_type=doc_type, entity_name=entity_name,
+        progress_cb=progress_cb,
     )
     return {
         "case_id": case_id,

@@ -81,6 +81,12 @@ class QuestionResult:
     validation_status: str = ""
     answer_length: int = 0
     answer: str = ""
+    # Email-specific metrics
+    citation_precision: float = 0.0        # fraction of citations that reference actual sources
+    unsupported_claim_rate: float = 0.0    # fraction of answer claims not grounded in docs
+    critical_fact_warnings: int = 0        # number of critical fact warnings raised
+    stitched_chunks_used: int = 0          # count of neighbor-stitched chunks in results
+    email_metadata_coverage: float = 0.0   # fraction of docs with email metadata present
 
 
 # ── LLM-as-judge models ─────────────────────────────────────────────
@@ -309,6 +315,37 @@ def evaluate_question(question: TestQuestion, case_id: str) -> QuestionResult:
         except Exception as exc:
             logger.error("Relevance judge failed: %s", exc)
 
+    # ── Email-specific metrics ────────────────────────────────────
+    # Citation precision: fraction of [Source: ...] citations referencing actual retrieved sources
+    if result.answer:
+        import re
+        cited_sources = re.findall(r'\[Source:\s*([^\],]+)', result.answer)
+        if cited_sources:
+            matched = sum(
+                1 for cs in cited_sources
+                if any(cs.strip() in rs for rs in result.retrieved_sources)
+            )
+            result.citation_precision = matched / len(cited_sources)
+
+    # Critical fact warnings count
+    critical_assessments = state.get("critical_fact_assessments", [])
+    result.critical_fact_warnings = sum(
+        1 for a in critical_assessments if not a.get("is_sufficiently_supported", True)
+    )
+
+    # Stitched chunks count
+    result.stitched_chunks_used = sum(
+        1 for d in docs if d.metadata.get("is_stitched", False)
+    )
+
+    # Email metadata coverage
+    if docs:
+        with_email_meta = sum(
+            1 for d in docs
+            if d.metadata.get("email_from") or d.metadata.get("email_subject") or d.metadata.get("message_id")
+        )
+        result.email_metadata_coverage = with_email_meta / len(docs)
+
     return result
 
 
@@ -393,6 +430,13 @@ def generate_report(results: list[QuestionResult]) -> dict[str, Any]:
     grader_pass_rate = sum(1 for r in results if r.grader_score == "yes") / n
     rewrite_rate = sum(1 for r in results if r.loop_count > 0) / n
 
+    # Email-specific aggregate metrics
+    avg_citation_precision = round(sum(r.citation_precision for r in results) / n, 3)
+    avg_unsupported_rate = round(sum(r.unsupported_claim_rate for r in results) / n, 3)
+    total_critical_warnings = sum(r.critical_fact_warnings for r in results)
+    total_stitched = sum(r.stitched_chunks_used for r in results)
+    avg_email_coverage = round(sum(r.email_metadata_coverage for r in results) / n, 3)
+
     return {
         "num_questions": n,
         "answer_quality": {
@@ -411,6 +455,13 @@ def generate_report(results: list[QuestionResult]) -> dict[str, Any]:
             "grader_pass_rate": round(grader_pass_rate, 3),
             "rewrite_rate": round(rewrite_rate, 3),
             "node_avg_latency_seconds": node_avg_latency,
+        },
+        "email_metrics": {
+            "avg_citation_precision": avg_citation_precision,
+            "avg_unsupported_claim_rate": avg_unsupported_rate,
+            "total_critical_fact_warnings": total_critical_warnings,
+            "total_stitched_chunks_used": total_stitched,
+            "avg_email_metadata_coverage": avg_email_coverage,
         },
     }
 
@@ -445,6 +496,16 @@ def print_report(report: dict[str, Any]) -> None:
     print("  Node latencies:")
     for node, lat in pm["node_avg_latency_seconds"].items():
         print(f"    {node:15s}  {lat}s")
+
+    # Email-specific metrics
+    em = report.get("email_metrics")
+    if em:
+        print("\n  --- Email Pipeline Metrics ---")
+        print(f"  Avg citation precision:        {em['avg_citation_precision']}")
+        print(f"  Avg unsupported claim rate:     {em['avg_unsupported_claim_rate']}")
+        print(f"  Total critical fact warnings:   {em['total_critical_fact_warnings']}")
+        print(f"  Total stitched chunks used:     {em['total_stitched_chunks_used']}")
+        print(f"  Avg email metadata coverage:    {em['avg_email_metadata_coverage']}")
 
     print("\n" + "=" * 60)
 
@@ -552,6 +613,11 @@ def main() -> None:
                     "validation_status": r.validation_status,
                     "answer_length": r.answer_length,
                     "retrieved_sources": r.retrieved_sources,
+                    "citation_precision": r.citation_precision,
+                    "unsupported_claim_rate": r.unsupported_claim_rate,
+                    "critical_fact_warnings": r.critical_fact_warnings,
+                    "stitched_chunks_used": r.stitched_chunks_used,
+                    "email_metadata_coverage": r.email_metadata_coverage,
                     "node_timings": [
                         {"node": t.node, "seconds": t.duration_seconds}
                         for t in r.node_timings

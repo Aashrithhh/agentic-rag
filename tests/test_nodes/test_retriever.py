@@ -36,6 +36,11 @@ def test_returns_documents(
     """Retriever returns Document objects from hybrid_search results."""
     mock_settings.cache_retrieval_enabled = False
     mock_settings.top_k = 3
+    # Email-pipeline feature flags (must be set to avoid MagicMock comparisons)
+    mock_settings.neighbor_stitching = False
+    mock_settings.attachment_context_link = False
+    mock_settings.metadata_boost_enabled = False
+    mock_settings.rerank_enabled = False
 
     mock_filter.return_value = {"doc_type": "compliance-report"}
     mock_engine.return_value = MagicMock()

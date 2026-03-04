@@ -73,6 +73,8 @@ def test_claims_extracted_and_verified(
     mock_settings.openai_model = "gpt-4o"
     mock_settings.openai_api_key = "fake"
     mock_settings.validation_api_base = "http://localhost:8000"
+    # Critical fact protection settings
+    mock_settings.critical_fact_protection = False
 
     claim = ExtractedClaim(
         claim="Revenue was $2.3M",

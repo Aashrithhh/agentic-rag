@@ -40,3 +40,6 @@ class AgentState(TypedDict, total=False):
     post_check_result: dict                          # from answer post-checker
     quality_downgrade: bool                          # set when fallback model used
     hitl_review_id: str                              # set when flagged for human review
+
+    # ── Email-aware pipeline enrichment ─────────────────
+    critical_fact_assessments: list[dict]             # from validator critical fact protection

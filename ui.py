@@ -460,6 +460,30 @@ with tab_query:
         placeholder="e.g. What were the issues with the Indian workers at Big Thorium?",
     )
 
+    # ── Email metadata filters (collapsible) ──────────────
+    with st.expander("📧 Email Filters (optional)", expanded=False):
+        filter_col1, filter_col2 = st.columns(2)
+        with filter_col1:
+            email_from_filter = st.text_input(
+                "From (sender)", key="filter_email_from",
+                placeholder="e.g. sarah.johnson",
+            )
+            email_date_from = st.date_input(
+                "Date from", value=None, key="filter_date_from",
+            )
+        with filter_col2:
+            email_to_filter = st.text_input(
+                "To (recipient)", key="filter_email_to",
+                placeholder="e.g. compliance@techcorp.com",
+            )
+            email_date_to = st.date_input(
+                "Date to", value=None, key="filter_date_to",
+            )
+        source_file_filter = st.text_input(
+            "Source file", key="filter_source_file",
+            placeholder="e.g. email_fraud_investigation.txt",
+        )
+
     col_run, col_clear = st.columns([1, 5])
     with col_run:
         run_clicked = st.button("▶  Run Query", type="primary", use_container_width=True)
@@ -481,12 +505,27 @@ with tab_query:
         # Ensure the per-case database is ready
         init_db(selected_case.case_id)
 
+        # ── Build email metadata filters ─────────────────────
+        email_filters: dict[str, str] = {}
+        if email_from_filter:
+            email_filters["email_from"] = email_from_filter
+        if email_to_filter:
+            email_filters["email_to"] = email_to_filter
+        if email_date_from:
+            email_filters["email_date_from"] = str(email_date_from)
+        if email_date_to:
+            email_filters["email_date_to"] = str(email_date_to)
+        if source_file_filter:
+            email_filters["source_file"] = source_file_filter
+
         # Build initial state with case-level isolation
         initial_state: AgentState = {
             "query": query.strip(),
             "loop_count": 0,
             "case_id": selected_case.case_id,
         }
+        if email_filters:
+            initial_state["metadata_filter"] = email_filters
 
         agent = compile_graph()
 
@@ -573,6 +612,20 @@ with tab_query:
                         f"Validation status: **{final_state['validation_status'].upper()}** "
                         "— some claims could not be verified. See discrepancy notes above."
                     )
+
+                # Critical fact warnings
+                critical_facts = final_state.get("critical_fact_assessments", [])
+                weak_facts = [a for a in critical_facts if not a.get("is_sufficiently_supported")]
+                if weak_facts:
+                    with st.expander("⚠️ Insufficient Evidence Warnings", expanded=True):
+                        for wf in weak_facts:
+                            values = ", ".join(str(v) for v in wf.get("critical_values", []))
+                            st.warning(
+                                f"**Claim:** {wf['claim']}  \n"
+                                f"Critical values: `{values}`  \n"
+                                f"Supporting docs: {wf['support_count']}/{wf['min_required']} required  \n"
+                                f"Sources: {', '.join(wf.get('supporting_sources', [])) or 'none'}"
+                            )
             else:
                 st.info("No answer was generated.")
 
@@ -582,7 +635,29 @@ with tab_query:
             for i, doc in enumerate(docs, 1):
                 src = doc.metadata.get("source", "unknown")
                 page = doc.metadata.get("page", "?")
-                st.markdown(f"**Document {i}** — `{src}` (page {page})")
+                email_from = doc.metadata.get("email_from", "")
+                email_subject = doc.metadata.get("email_subject", "")
+                chunk_type = doc.metadata.get("chunk_type", "")
+                is_stitched = doc.metadata.get("is_stitched", False)
+                is_att = doc.metadata.get("is_attachment_context", False)
+                boost = doc.metadata.get("metadata_boost", 0)
+
+                # Build info line
+                info_parts = [f"`{src}` (page {page})"]
+                if email_from:
+                    info_parts.append(f"📤 {email_from}")
+                if email_subject:
+                    info_parts.append(f"📋 {email_subject}")
+                if chunk_type:
+                    info_parts.append(f"🏷️ {chunk_type}")
+                if is_stitched:
+                    info_parts.append("🔗 *stitched*")
+                if is_att:
+                    info_parts.append("📎 *attachment*")
+                if boost > 0:
+                    info_parts.append(f"⬆️ boost={boost:.2f}")
+
+                st.markdown(f"**Document {i}** — {' | '.join(info_parts)}")
                 st.text(doc.page_content[:500])
                 st.markdown("---")
 

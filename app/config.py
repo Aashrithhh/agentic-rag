@@ -66,6 +66,24 @@ class Settings(BaseSettings):
     # ── Structure-aware chunking ───────────────────
     use_structure_aware_chunking: bool = True
 
+    # ── Email-aware chunking & retrieval (feature flags) ──────────
+    email_chunk_rules: bool = True               # email-boundary-aware chunking
+    email_dynamic_chunk_size: bool = True         # shorter for dense legal, larger for conversational
+    email_chunk_size_dense: int = 512             # legal/compliance text
+    email_chunk_size_normal: int = 1024           # standard text
+    email_chunk_size_conversational: int = 1500   # conversational email
+    neighbor_stitching: bool = True               # fetch chunk_index ± 1 at retrieval time
+    neighbor_stitch_window: int = 1               # how many neighbors on each side
+    context_merge: bool = True                    # merge & dedup stitched chunks
+    attachment_context_link: bool = True           # link attachment chunks to parent email
+    attachment_context_top_k: int = 2             # max attachment chunks to include per parent
+    critical_fact_protection: bool = True          # require 2+ spans for numeric/date claims
+    critical_fact_min_spans: int = 2              # min supporting spans for critical facts
+    metadata_boost_enabled: bool = True           # boost chunks with exact entity/date/token matches
+    metadata_boost_weight: float = 0.15           # weight added for metadata matches
+    staleness_penalty_enabled: bool = False        # penalize stale chunks by metadata rules
+    staleness_penalty_weight: float = 0.05        # weight subtracted for staleness
+
     # ── Metadata enrichment (LLM-based, off by default — expensive) ──
     enable_metadata_enrichment: bool = False
     enrichment_batch_size: int = 10

@@ -11,7 +11,10 @@
       "Bash(python -c \"from app.ingest import load_documents, load_xlsx, load_xls, load_pptx, load_markdown, load_rtf, load_doc, load_xml, load_generic_csv, load_tsv, load_logs, load_zip; print\\(''All 11 new loaders + dispatcher import OK''\\)\")",
       "Bash(python -m pytest tests/ -q)",
       "Bash(REQUIRE_BLOB_SOURCE=false python -c \":*)",
-      "Bash(REQUIRE_BLOB_SOURCE=false AZURE_STORAGE_CONNECTION_STRING=\"\" AZURE_STORAGE_SAS_URL=\"\" python -c \":*)"
+      "Bash(REQUIRE_BLOB_SOURCE=false AZURE_STORAGE_CONNECTION_STRING=\"\" AZURE_STORAGE_SAS_URL=\"\" python -c \":*)",
+      "Bash(python -c \"from app.ingest import ingest, ingest_case, embed_chunks; print\\(''All imports OK''\\)\")",
+      "Bash(git restore app/audit_log.py app/config.py requirements.txt ui.py)",
+      "Bash(python -m app.ingest --case demo-pst --blob-prefix demo-pst)"
     ]
   }
 }

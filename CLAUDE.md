@@ -35,7 +35,7 @@ START → Intent Router → Retriever → Grader → [Rewriter (loop)] → Valid
 |---|---|
 | [app/graph.py](app/graph.py) | LangGraph graph definition — all nodes and edges |
 | [app/state.py](app/state.py) | `AgentState` TypedDict — the state flowing through all nodes |
-| [app/llm.py](app/llm.py) | LLM provider factory — `get_chat_llm()` returns OpenAI or Ollama |
+| [app/llm.py](app/llm.py) | LLM provider factory — `get_chat_llm()` returns OpenAI, Ollama, or HuggingFace |
 | [app/api.py](app/api.py) | FastAPI REST interface |
 | [ui.py](ui.py) | Streamlit UI |
 | [app/config.py](app/config.py) | All settings via `pydantic-settings` (loaded from `.env`) |
@@ -55,6 +55,7 @@ START → Intent Router → Retriever → Grader → [Rewriter (loop)] → Valid
 | Hallucination Guard | `app/nodes/hallucination_guard.py` | Risk scoring: pass / warn / block |
 
 ### Supporting Modules
+- `app/llm.py` — LLM provider factory; `_HuggingFaceChatWrapper` + `_JsonExtractorChain` for HF structured output
 - `app/chunking.py` — email-aware + structure-aware chunking
 - `app/reranker.py` — Cohere / cross-encoder / LLM reranking
 - `app/intent_router.py` — intent classification (fact_lookup, summary, timeline, comparison, exploratory)
@@ -75,15 +76,20 @@ START → Intent Router → Retriever → Grader → [Rewriter (loop)] → Valid
 All settings live in `app/config.py` as a `pydantic-settings` `Settings` class.
 
 ### LLM Provider
-Controlled by `LLM_PROVIDER` (`"openai"` default | `"ollama"`). All nodes call `get_chat_llm()` from `app/llm.py` — never instantiate LLMs directly.
+Controlled by `LLM_PROVIDER` (`"openai"` | `"ollama"` | `"huggingface"`). All nodes call `get_chat_llm()` from `app/llm.py` — never instantiate LLMs directly.
 
 | Provider | Key settings |
 |---|---|
 | `openai` | `OPENAI_API_KEY`, `OPENAI_MODEL=gpt-4o` |
 | `ollama` | `OLLAMA_BASE_URL=http://localhost:11434`, `OLLAMA_MODEL=phi3:mini`, `OLLAMA_NUM_CTX=4096` |
+| `huggingface` | `HUGGINGFACE_API_KEY`, `HUGGINGFACE_MODEL=Qwen/Qwen2.5-72B-Instruct` |
 | Azure OpenAI | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT` |
 
-Ollama v0.17.6 installed. Models: `phi3:mini` (2.2 GB, active), `llama3.2:3b` (2.0 GB, backup). CPU-only, no GPU. OpenAI key temporarily expired — Ollama is the active LLM provider until renewed.
+**Active provider: HuggingFace Inference API** (`Qwen/Qwen2.5-72B-Instruct`) via OpenAI-compatible endpoint at `https://router.huggingface.co/v1`. Free GPU-powered inference.
+
+HuggingFace does **not** support OpenAI structured outputs or json_mode. `app/llm.py` wraps the client in `_HuggingFaceChatWrapper` which intercepts `with_structured_output()` and uses prompt-based JSON extraction via `_JsonExtractorChain` instead.
+
+Ollama v0.17.6 also installed locally (CPU-only). Models: `phi3:mini` (2.2 GB), `llama3.2:3b` (2.0 GB). Used as fallback only — too slow for pipeline use (~4 min/call on CPU).
 
 Embeddings: Cohere (`COHERE_API_KEY`, `embed-english-v3.0`)
 Database: PostgreSQL + pgvector (`DATABASE_URL`)
@@ -96,6 +102,13 @@ Key feature flags (all in `.env` or `config.py`):
 - `NEIGHBOR_STITCHING` — fetch adjacent chunks at retrieval
 - `CRITICAL_FACT_PROTECTION` — require 2+ spans for numeric/date claims
 - `PII_REDACTION_ENABLED` — PII redaction (off by default — investigation data)
+
+### Local Exports
+Flagged document sets are saved to **both** PostgreSQL (`saved_flagged_docs` table) and local PDF:
+- Path: `exports/flagged/<case_id>/<filename>.pdf`
+- Generated via `_export_flagged_pdf()` in `ui.py` using `reportlab`
+- Also supports natural-language save commands in the UI: `save doc 1 and 3 as susp_3`
+  - Regex-first parsing, LLM fallback for non-standard phrasing
 
 ## API Auth
 All `/api/v1/*` endpoints require `X-API-Key` header.

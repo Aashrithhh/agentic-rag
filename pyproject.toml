@@ -35,7 +35,7 @@ dependencies = [
 [project.optional-dependencies]
 formats = [
     "langchain-google-genai>=2.0.0",
-    "Pillow>=10.0.0",
+    "Pillow>=11.1.0",
     "pytesseract>=0.3.10",
     "python-docx>=1.0.0",
     "extract-msg>=0.48.0",
@@ -56,6 +56,9 @@ production = [
 ]
 dev = ["pytest", "pytest-asyncio", "pytest-cov", "ruff", "respx>=0.21.0"]
 load = ["locust>=2.0.0"]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

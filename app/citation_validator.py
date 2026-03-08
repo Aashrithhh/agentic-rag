@@ -17,10 +17,10 @@ from typing import Any, Literal
 
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from app.config import settings
+from app.llm import get_chat_llm
 
 logger = logging.getLogger(__name__)
 
@@ -252,12 +252,7 @@ def post_check_answer(
     )
 
     try:
-        llm = ChatOpenAI(
-            model=settings.openai_model,
-            api_key=settings.openai_api_key,
-            temperature=0,
-            max_tokens=2048,
-        )
+        llm = get_chat_llm(temperature=0, max_tokens=2048)
         chain = _postcheck_prompt | llm.with_structured_output(PostCheckResult)
         result = chain.invoke({"answer": answer, "documents": doc_text})
 

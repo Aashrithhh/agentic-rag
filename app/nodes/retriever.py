@@ -101,7 +101,8 @@ def _retriever_node_inner(state: AgentState) -> dict:
     # Merge user-provided email filters from state (UI/API)
     user_filters = state.get("metadata_filter")
     if user_filters and isinstance(user_filters, dict):
-        meta_filter = {**(meta_filter or {}), **user_filters}
+        # Case-set constraints (meta_filter) take precedence over user filters
+        meta_filter = {**(user_filters or {}), **(meta_filter or {})}
 
     logger.info("Retriever — query: %s | case: %s | db: %s | filter: %s",
                 query_text, case_id,
@@ -115,7 +116,9 @@ def _retriever_node_inner(state: AgentState) -> dict:
             {"case_id": case_id, "query": query_text,
              "top_k": settings.top_k, "filter": meta_filter,
              "neighbor_stitching": settings.neighbor_stitching,
-             "attachment_context": settings.attachment_context_link},
+             "attachment_context": settings.attachment_context_link,
+             "metadata_boost_enabled": settings.metadata_boost_enabled,
+             "email_completion": True},
             prefix=case_id,
         )
         hit, cached_docs = cache.get("retrieval", rk)
@@ -160,6 +163,7 @@ def _retriever_node_inner(state: AgentState) -> dict:
                     "attachment_names": row.get("attachment_names", ""),
                     "parent_message_id": row.get("parent_message_id", ""),
                     "total_chunks": row.get("total_chunks"),
+                    "body_only": row.get("body_only", ""),
                     "rrf_score": row.get("rrf_score"),
                     **(row.get("metadata_extra") or {}),
                 },
@@ -193,6 +197,11 @@ def _retriever_node_inner(state: AgentState) -> dict:
             logger.info("Reranker — kept top %d docs after reranking.", len(docs))
         except Exception as exc:
             logger.warning("Reranking failed (using original order): %s", exc)
+
+    # ── Email completion: fetch ALL sibling chunks AFTER reranking ──
+    # This ensures the reranker doesn't discard sibling chunks needed
+    # to assemble complete emails in the UI.
+    docs = _complete_email_chunks(engine, docs)
 
     logger.info("Retriever — returned %d documents from '%s'.", len(docs), case_id)
     return {"retrieved_docs": docs, "reranked": reranked}
@@ -420,3 +429,63 @@ def _apply_metadata_boost(query_text: str, docs: list[Document]) -> list[Documen
         logger.info("Metadata boost: boosted %d/%d documents.", boosted_count, len(docs))
 
     return docs
+
+
+# ── Email Completion ─────────────────────────────────────────────────
+
+
+def _complete_email_chunks(
+    engine,
+    docs: list[Document],
+) -> list[Document]:
+    """For each retrieved email chunk, fetch ALL sibling chunks from the same
+    message_id so the full email can be assembled in the UI.
+
+    Deduplicates by chunk ID to avoid repeating chunks already present.
+    """
+    from app.db import fetch_all_email_chunks
+
+    seen_ids: set[int] = {d.metadata.get("id") for d in docs if d.metadata.get("id")}
+    # Track which message_ids we've already completed
+    completed_msg_ids: set[str] = set()
+    new_docs: list[Document] = []
+
+    for doc in docs:
+        msg_id = doc.metadata.get("message_id", "")
+        if not msg_id or msg_id in completed_msg_ids:
+            continue
+        completed_msg_ids.add(msg_id)
+
+        siblings = fetch_all_email_chunks(engine, msg_id)
+
+        for sib in siblings:
+            if sib["id"] in seen_ids:
+                continue
+            seen_ids.add(sib["id"])
+            new_docs.append(Document(
+                page_content=sib["content"],
+                metadata={
+                    "id": sib["id"],
+                    "source": sib["source"],
+                    "page": sib.get("page"),
+                    "chunk_index": sib.get("chunk_index"),
+                    "doc_type": sib.get("doc_type"),
+                    "entity_name": sib.get("entity_name"),
+                    "message_id": sib.get("message_id", ""),
+                    "thread_id": sib.get("thread_id", ""),
+                    "chunk_type": sib.get("chunk_type", ""),
+                    "email_subject": sib.get("email_subject", ""),
+                    "email_from": sib.get("email_from", ""),
+                    "email_to": sib.get("email_to", ""),
+                    "email_date": sib.get("email_date", ""),
+                    "body_only": sib.get("body_only", ""),
+                    "total_chunks": sib.get("total_chunks"),
+                    "is_sibling": True,
+                    **(sib.get("metadata_extra") or {}),
+                },
+            ))
+
+    if new_docs:
+        logger.info("Email completion: added %d sibling chunks to assemble full emails.", len(new_docs))
+
+    return docs + new_docs

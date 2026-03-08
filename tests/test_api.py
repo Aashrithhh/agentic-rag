@@ -93,6 +93,9 @@ class TestQueryEndpoint:
             "grader_score": "yes",
             "loop_count": 0,
             "validation_status": "pass",
+            "hallucination_score": 0.12,
+            "hallucination_decision": "pass",
+            "hallucination_flags": [],
         }
         mock_graph.return_value = mock_agent
 
@@ -105,6 +108,32 @@ class TestQueryEndpoint:
         assert data["answer"] == "Test answer"
         assert data["case_id"] == "big-thorium"
         assert data["latency_seconds"] >= 0
+        assert data["hallucination_score"] == 0.12
+        assert data["hallucination_decision"] == "pass"
+        assert data["hallucination_flags"] == []
+
+    @patch("app.api.compile_graph")
+    @patch("app.api.init_db")
+    def test_hallucination_fields_default_when_missing(self, mock_init, mock_graph, client):
+        """When pipeline result lacks hallucination fields, defaults are used."""
+        mock_agent = MagicMock()
+        mock_agent.invoke.return_value = {
+            "answer": "Legacy answer",
+            "grader_score": "yes",
+            "loop_count": 0,
+            "validation_status": "pass",
+        }
+        mock_graph.return_value = mock_agent
+
+        resp = client.post("/api/v1/query", json={
+            "query": "What happened?",
+            "case_id": "big-thorium",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["hallucination_score"] == 0.0
+        assert data["hallucination_decision"] == "pass"
+        assert data["hallucination_flags"] == []
 
     def test_empty_query_rejected(self, client):
         resp = client.post("/api/v1/query", json={

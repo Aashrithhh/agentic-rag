@@ -22,11 +22,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 from langchain_core.documents import Document
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
-from app.config import settings
+from app.llm import get_chat_llm
 from app.db import init_db
 from app.graph import compile_graph
 from app.state import AgentState
@@ -183,13 +182,8 @@ _RELEVANCE_HUMAN = """\
 Score the relevance of this answer to the query."""
 
 
-def _get_judge_llm() -> ChatOpenAI:
-    return ChatOpenAI(
-        model=settings.openai_model,
-        api_key=settings.openai_api_key,
-        temperature=0,
-        max_tokens=512,
-    )
+def _get_judge_llm():
+    return get_chat_llm(temperature=0, max_tokens=512)
 
 
 def judge_faithfulness(
@@ -345,6 +339,32 @@ def evaluate_question(question: TestQuestion, case_id: str) -> QuestionResult:
             if d.metadata.get("email_from") or d.metadata.get("email_subject") or d.metadata.get("message_id")
         )
         result.email_metadata_coverage = with_email_meta / len(docs)
+
+    # Unsupported claim rate: fraction of answer claims not grounded in docs
+    if result.answer and docs:
+        import re as _re
+        # Extract claim-like sentences from the answer
+        sentences = [s.strip() for s in _re.split(r'(?<=[.!?])\s+', result.answer) if s.strip()]
+        total_claims = 0
+        unsupported_claims = 0
+        for sentence in sentences:
+            # Skip headings, bullets starting with ##, or very short fragments
+            if sentence.startswith("#") or len(sentence) < 20:
+                continue
+            total_claims += 1
+            # Check if any retrieved doc contains key words from the sentence
+            key_words = set(_re.findall(r'\b[A-Za-z]{4,}\b', sentence.lower()))
+            if not key_words:
+                continue
+            grounded = any(
+                len(key_words & set(_re.findall(r'\b[A-Za-z]{4,}\b', d.page_content.lower()))) >= max(2, len(key_words) // 3)
+                for d in docs
+            )
+            if not grounded:
+                unsupported_claims += 1
+        result.unsupported_claim_rate = (
+            unsupported_claims / total_claims
+        ) if total_claims > 0 else 0.0
 
     return result
 

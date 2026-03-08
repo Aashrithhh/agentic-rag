@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import logging
 
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
 from app.cache import cache, key_for, stable_hash
 from app.config import settings
+from app.llm import get_chat_llm
 from app.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -102,7 +102,7 @@ def _generator_node_inner(state: AgentState) -> dict:
              "validation_results": v_results,
              "validation_status": v_status,
              "critical_warnings": critical_warnings,
-             "model": settings.openai_model},
+             "model": settings.active_llm_model},
             prefix=f"generator:{case_id}",
         )
         hit, cached = cache.get("llm", ck)
@@ -110,11 +110,7 @@ def _generator_node_inner(state: AgentState) -> dict:
             logger.info("Generator cache HIT — returning %d-char cached answer.", len(cached["answer"]))
             return cached
 
-    llm = ChatOpenAI(
-        model=settings.openai_model,
-        api_key=settings.openai_api_key,
-        temperature=0, max_tokens=4096,
-    )
+    llm = get_chat_llm(temperature=0, max_tokens=4096)
 
     chain = _prompt | llm
     from app.resilience import invoke_with_retry

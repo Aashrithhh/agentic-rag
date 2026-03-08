@@ -8,7 +8,7 @@ import pytest
 
 pytestmark = pytest.mark.unit
 
-from app.graph import _route_after_grader
+from app.graph import _route_after_grader, build_graph
 
 
 def test_route_yes_goes_to_validator():
@@ -39,3 +39,16 @@ def test_route_default_score_is_no():
     with patch("app.graph.settings") as mock_settings:
         mock_settings.max_rewrite_loops = 3
         assert _route_after_grader(state) == "rewriter"
+
+
+def test_graph_includes_hallucination_guard_node():
+    """Graph should contain the hallucination_guard node."""
+    graph = build_graph()
+    assert "hallucination_guard" in graph.nodes
+
+
+def test_graph_generator_routes_to_hallucination_guard():
+    """Generator should route to hallucination_guard, not directly to END."""
+    graph = build_graph()
+    gen_edges = graph.edges
+    assert ("generator", "hallucination_guard") in gen_edges

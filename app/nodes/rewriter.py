@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import logging
 
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
 from app.cache import cache, key_for
 from app.config import settings
+from app.llm import get_chat_llm
 from app.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -66,7 +66,7 @@ def _rewriter_node_inner(state: AgentState) -> dict:
              "previous_query": previous_query,
              "grader_reasoning": grader_reasoning,
              "doc_summaries": doc_summaries or "(none)",
-             "model": settings.openai_model},
+             "model": settings.active_llm_model},
             prefix=f"rewriter:{case_id}",
         )
         hit, cached = cache.get("llm", ck)
@@ -74,12 +74,7 @@ def _rewriter_node_inner(state: AgentState) -> dict:
             logger.info("Rewriter cache HIT — returning '%s'", cached["rewritten_query"][:80])
             return {"rewritten_query": cached["rewritten_query"], "loop_count": loop + 1}
 
-    llm = ChatOpenAI(
-        model=settings.openai_model,
-        api_key=settings.openai_api_key,
-        temperature=0.3,
-        max_tokens=512,
-    )
+    llm = get_chat_llm(temperature=0.3, max_tokens=512)
 
     chain = _prompt | llm
     from app.resilience import invoke_with_retry

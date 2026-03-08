@@ -13,11 +13,13 @@ and a dedicated audit log file for compliance retention.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,8 +47,11 @@ AuditEventType = Literal[
     "circuit_breaker_state_change",
     "hitl_review_submitted",
     "hitl_review_completed",
+    "hitl_flagged",
     "secret_rotated",
     "config_changed",
+    "feedback_submitted",
+    "chat_saved",
 ]
 
 
@@ -83,6 +88,9 @@ class AuditLogger:
         self._audit_logger = logging.getLogger("app.audit.events")
         self._events: list[AuditEvent] = []  # in-memory buffer for recent events
         self._max_buffer = 10000
+        # Bounded LRU set for deduplication (event_key -> True)
+        self._recent_event_keys: OrderedDict[str, bool] = OrderedDict()
+        self._dedup_max = 5000
         self._setup_file_handler()
 
     def _setup_file_handler(self) -> None:
@@ -99,9 +107,43 @@ class AuditLogger:
         except Exception as exc:
             logger.warning("Could not set up audit file handler: %s", exc)
 
+    def _compute_event_key(self, event: AuditEvent) -> str:
+        """Compute a stable dedup key from event_type + session/case + timestamp."""
+        raw = f"{event.event_type}|{event.case_id}|{json.dumps(event.details, sort_keys=True, default=str)}|{event.timestamp}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+    def _is_duplicate(self, event: AuditEvent) -> bool:
+        """Return True if this exact event was already logged recently."""
+        key = self._compute_event_key(event)
+        if key in self._recent_event_keys:
+            return True
+        self._recent_event_keys[key] = True
+        if len(self._recent_event_keys) > self._dedup_max:
+            self._recent_event_keys.popitem(last=False)
+        return False
+
+    def _get_request_context(self) -> tuple[str, str]:
+        """Get ip_address and request_id from the current request context."""
+        ip_address = ""
+        request_id = ""
+        try:
+            from app.api import request_id_var
+            request_id = request_id_var.get("")
+        except Exception:
+            pass
+        # ip_address is populated by callers who have access to the Request object
+        return ip_address, request_id
+
     def log(self, event: AuditEvent) -> None:
-        """Record an audit event."""
+        """Record an audit event with deduplication."""
+        # Populate request_id from context if not already set
+        if not event.request_id:
+            _, ctx_rid = self._get_request_context()
+            event.request_id = ctx_rid
+
         with self._lock:
+            if self._is_duplicate(event):
+                return
             self._events.append(event)
             if len(self._events) > self._max_buffer:
                 self._events = self._events[-self._max_buffer:]
@@ -146,16 +188,22 @@ class AuditLogger:
         case_id: str,
         user: str = "api_user",
         request_id: str = "",
+        ip_address: str = "",
         latency_seconds: float = 0.0,
         success: bool = True,
     ) -> None:
         event_type: AuditEventType = "query_completed" if success else "query_failed"
+        # Hash the query for privacy — do not log plaintext
+        query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
         self.log(AuditEvent(
             event_type=event_type,
             user=user, case_id=case_id,
             request_id=request_id,
+            ip_address=ip_address,
             details={
-                "query": query[:500],
+                "query_hash": query_hash,
+                "query_length": len(query),
+                "redaction_method": "sha256_truncated",
                 "latency_seconds": latency_seconds,
             },
         ))
@@ -202,11 +250,41 @@ class AuditLogger:
         action: Literal["detected", "redacted"] = "detected",
     ) -> None:
         event_type: AuditEventType = "pii_detected" if action == "detected" else "pii_redacted"
+        if not case_id:
+            case_id = "unknown_case"
+            logger.warning("PII event logged without case_id — using 'unknown_case'")
         self.log(AuditEvent(
             event_type=event_type,
             case_id=case_id,
             severity="warning",
             details={"pii_types": pii_types, "count": count},
+        ))
+
+    def log_feedback_submitted(
+        self,
+        case_id: str,
+        session_id: str,
+        num_flags: int,
+        ip_address: str = "",
+    ) -> None:
+        self.log(AuditEvent(
+            event_type="feedback_submitted",
+            case_id=case_id,
+            ip_address=ip_address,
+            details={"session_id": session_id, "num_flags": num_flags},
+        ))
+
+    def log_chat_saved(
+        self,
+        case_id: str,
+        chat_id: str,
+        ip_address: str = "",
+    ) -> None:
+        self.log(AuditEvent(
+            event_type="chat_saved",
+            case_id=case_id,
+            ip_address=ip_address,
+            details={"chat_id": chat_id},
         ))
 
     def log_secret_rotation(self, secret_name: str, success: bool) -> None:

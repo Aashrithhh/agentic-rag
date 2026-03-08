@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class RetrievalFeedback(BaseModel):
@@ -46,3 +46,28 @@ class ChatArchive(BaseModel):
     loop_count: int = 0
     saved_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     storage_type: Literal["local"] = "local"
+
+    @model_validator(mode="after")
+    def deduplicate_docs_and_flags(self) -> "ChatArchive":
+        """Deduplicate retrieved_docs by (source, page) and flags by
+        (session_id, document_source, document_page), keeping last occurrence.
+        Normalizes flag values to 'yes'/'no'/'unflagged'.
+        """
+        # Deduplicate retrieved_docs: prefer 'yes' > 'no' > 'unflagged'
+        seen_docs: dict[tuple, "ArchivedDocument"] = {}
+        flag_priority = {"yes": 2, "no": 1, "unflagged": 0}
+        for doc in self.retrieved_docs:
+            key = (doc.source, doc.page)
+            existing = seen_docs.get(key)
+            if existing is None or flag_priority.get(doc.flag, 0) > flag_priority.get(existing.flag, 0):
+                seen_docs[key] = doc
+        self.retrieved_docs = list(seen_docs.values())
+
+        # Deduplicate flags by (session_id, document_source, document_page) — keep last
+        seen_flags: dict[tuple, "RetrievalFeedback"] = {}
+        for flag in self.flags:
+            key = (flag.session_id, flag.document_source, flag.document_page)
+            seen_flags[key] = flag  # last wins
+        self.flags = list(seen_flags.values())
+
+        return self

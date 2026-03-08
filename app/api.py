@@ -31,7 +31,9 @@ import uuid
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from datetime import datetime as _datetime
+
+from pydantic import BaseModel, Field, field_validator
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -136,9 +138,20 @@ class QueryRequest(BaseModel):
     # ── Optional email metadata filters ──────────────────
     email_from: str | None = Field(default=None, description="Filter by sender (partial match)")
     email_to: str | None = Field(default=None, description="Filter by recipient (partial match)")
-    email_date_from: str | None = Field(default=None, description="Filter emails from this date (ISO format)")
-    email_date_to: str | None = Field(default=None, description="Filter emails up to this date (ISO format)")
+    email_date_from: str | None = Field(default=None, description="Filter emails from this date (ISO format, e.g. 2024-01-31)")
+    email_date_to: str | None = Field(default=None, description="Filter emails up to this date (ISO format, e.g. 2024-01-31)")
     source_file: str | None = Field(default=None, description="Filter by source filename (partial match)")
+
+    @field_validator("email_date_from", "email_date_to", mode="before")
+    @classmethod
+    def validate_iso_date(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        try:
+            _datetime.fromisoformat(v)
+        except ValueError:
+            raise ValueError("Date must be a valid ISO format string (e.g. 2024-01-31 or 2024-01-31T00:00:00)")
+        return v
 
 
 class QueryResponse(BaseModel):
@@ -148,6 +161,9 @@ class QueryResponse(BaseModel):
     loop_count: int = 0
     validation_status: str = "pass"
     latency_seconds: float = 0.0
+    hallucination_score: float = 0.0
+    hallucination_decision: str = "pass"
+    hallucination_flags: list[dict] = Field(default_factory=list)
 
 
 class CaseInfo(BaseModel):
@@ -181,6 +197,13 @@ def get_metrics(request: Request, _key: str = Depends(require_api_key)):
     }
 
 
+def _validate_case_id(case_id: str) -> None:
+    """Raise 404 if case_id is not a registered case."""
+    known_ids = [c.case_id for c in list_cases()]
+    if case_id not in known_ids:
+        raise HTTPException(status_code=404, detail=f"Unknown case_id: {case_id}")
+
+
 @app.get("/api/v1/cases", response_model=list[CaseInfo])
 @limiter.limit(settings.api_rate_limit)
 def get_cases(request: Request, _key: str = Depends(require_api_key)) -> list[CaseInfo]:
@@ -200,9 +223,7 @@ def get_cases(request: Request, _key: str = Depends(require_api_key)) -> list[Ca
 @limiter.limit(settings.api_rate_limit)
 def run_query(request: Request, req: QueryRequest, _key: str = Depends(require_api_key)) -> QueryResponse:
     """Run the RAG pipeline for a query against a specific case."""
-    known_ids = [c.case_id for c in list_cases()]
-    if req.case_id not in known_ids:
-        raise HTTPException(status_code=404, detail=f"Unknown case_id: {req.case_id}")
+    _validate_case_id(req.case_id)
 
     init_db(req.case_id)
 
@@ -240,10 +261,14 @@ def run_query(request: Request, req: QueryRequest, _key: str = Depends(require_a
     # ── Audit log ──────────────────────────────────────────
     try:
         from app.audit_log import audit_log
+        client_ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.client.host if request.client else ""
         audit_log.log_query(
             case_id=req.case_id,
             query=req.query,
             user=request.headers.get("X-User", "api"),
+            request_id=request_id_var.get(""),
+            ip_address=client_ip,
+            latency_seconds=round(elapsed, 2),
         )
     except Exception:
         pass
@@ -255,6 +280,9 @@ def run_query(request: Request, req: QueryRequest, _key: str = Depends(require_a
         loop_count=result.get("loop_count", 0),
         validation_status=result.get("validation_status", "pass"),
         latency_seconds=round(elapsed, 2),
+        hallucination_score=result.get("hallucination_score", 0.0),
+        hallucination_decision=result.get("hallucination_decision", "pass"),
+        hallucination_flags=result.get("hallucination_flags", []),
     )
 
 
@@ -409,9 +437,10 @@ async def submit_job(request: Request, body: JobSubmitRequest, _key: str = Depen
 def cancel_job(request: Request, job_id: str, _key: str = Depends(require_api_key)):
     """Cancel a pending job."""
     from app.job_queue import job_queue
-    success = job_queue.cancel_job(job_id)
-    if not success:
-        raise HTTPException(status_code=400, detail="Job not found or already running/completed")
+    if not job_queue.get_job_status(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job_queue.cancel_job(job_id):
+        raise HTTPException(status_code=409, detail="Job cannot be cancelled — already running or completed")
     return {"job_id": job_id, "status": "cancelled"}
 
 # ── Data lifecycle endpoints ─────────────────────────────────────────
@@ -421,6 +450,7 @@ def cancel_job(request: Request, job_id: str, _key: str = Depends(require_api_ke
 @limiter.limit(settings.api_rate_limit)
 def data_inventory(request: Request, case_id: str, _key: str = Depends(require_api_key)):
     """Get data inventory and retention status for a case."""
+    _validate_case_id(case_id)
     from app.data_lifecycle import get_data_inventory
     inv = get_data_inventory(case_id)
     return {
@@ -477,7 +507,7 @@ class SaveChatRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=4000)
     answer: str
     retrieved_docs: list[dict] = Field(default_factory=list)
-    flags: list[dict] = Field(default_factory=list)
+    flags: list[FeedbackFlag] = Field(default_factory=list)
     validation_status: str = "pass"
     grader_score: str = ""
     loop_count: int = 0
@@ -492,7 +522,10 @@ def submit_feedback(
 ):
     """Submit per-document yes/no relevance flags for a query session."""
     from app.audit_log import audit_log
+    from app.chat_storage import save_feedback_local
     from app.feedback_models import RetrievalFeedback
+
+    client_ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "")
 
     feedback_records = [
         RetrievalFeedback(
@@ -506,16 +539,19 @@ def submit_feedback(
         for f in body.flags
     ]
 
+    saved_ids = save_feedback_local(feedback_records)
+
     audit_log.log_feedback_submitted(
         case_id=body.case_id,
         session_id=body.session_id,
-        num_flags=len(feedback_records),
+        num_flags=len(saved_ids),
+        ip_address=client_ip,
     )
 
     return {
         "status": "ok",
-        "feedback_count": len(feedback_records),
-        "feedback_ids": [fb.id for fb in feedback_records],
+        "feedback_count": len(saved_ids),
+        "feedback_ids": saved_ids,
     }
 
 
@@ -546,9 +582,9 @@ def save_chat_local_endpoint(
             case_id=body.case_id,
             session_id=body.session_id,
             query=body.query,
-            document_source=f.get("document_source", ""),
-            document_page=f.get("document_page"),
-            flag=f.get("flag", "no"),
+            document_source=f.document_source,
+            document_page=f.document_page,
+            flag=f.flag,
         )
         for f in body.flags
     ]
@@ -570,7 +606,7 @@ def save_chat_local_endpoint(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
-    audit_log.log_chat_saved(case_id=body.case_id, chat_id=chat_id)
+    audit_log.log_chat_saved(case_id=body.case_id, chat_id=chat_id, ip_address=request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else ""))
 
     return {"status": "ok", "chat_id": chat_id}
 
@@ -583,7 +619,168 @@ def list_local_chats(
     _key: str = Depends(require_api_key),
 ):
     """List saved chat archives for a given case."""
+    _validate_case_id(case_id)
     from app.chat_storage import list_saved_chats
 
     chats = list_saved_chats(case_id)
     return {"case_id": case_id, "chats": chats}
+
+
+# ── Flagged document save endpoints ──────────────────────────────────
+
+
+class FlaggedDocPayload(BaseModel):
+    """Single flagged document in the save request."""
+    source: str = ""
+    page: int | str | None = None
+    chunk_index: int | None = None
+    content: str = ""
+    metadata: dict = Field(default_factory=dict)
+    score: float | None = None
+
+
+class SaveFlaggedDocsRequest(BaseModel):
+    case_id: str = Field(..., min_length=1, max_length=200)
+    filename: str = Field(..., min_length=1, max_length=500)
+    query_text: str = Field(..., min_length=1, max_length=4000)
+    docs: list[FlaggedDocPayload] = Field(..., min_length=1)
+    saved_by: str | None = None
+
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, v: str) -> str:
+        import re
+        v = v.strip()
+        if not v:
+            raise ValueError("filename must not be blank")
+        if not re.match(r'^[\w\-. ]+$', v):
+            raise ValueError("filename may only contain letters, digits, hyphens, underscores, dots, and spaces")
+        return v
+
+
+class SaveFlaggedDocsResponse(BaseModel):
+    status: str = "ok"
+    id: int
+    case_id: str
+    filename: str
+    doc_count: int
+
+
+class FlaggedDocSetSummary(BaseModel):
+    id: int
+    case_id: str
+    filename: str
+    query_text: str
+    saved_at: str
+    saved_by: str | None
+    doc_count: int
+
+
+@app.post("/api/v1/flagged-docs/save", response_model=SaveFlaggedDocsResponse)
+@limiter.limit(settings.api_rate_limit)
+def save_flagged_docs_endpoint(
+    request: Request,
+    body: SaveFlaggedDocsRequest,
+    _key: str = Depends(require_api_key),
+):
+    """Persist a set of flagged retrieved documents to PostgreSQL."""
+    from app.db import save_flagged_doc_set
+
+    _validate_case_id(body.case_id)
+
+    engine = init_db(body.case_id)
+    docs_json = [d.model_dump() for d in body.docs]
+
+    from sqlalchemy.exc import IntegrityError
+    try:
+        row_id = save_flagged_doc_set(
+            engine,
+            case_id=body.case_id,
+            filename=body.filename,
+            query_text=body.query_text,
+            docs_json=docs_json,
+            saved_by=body.saved_by,
+        )
+    except IntegrityError:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A saved file named '{body.filename}' already exists for case '{body.case_id}'.",
+        )
+
+    return SaveFlaggedDocsResponse(
+        id=row_id,
+        case_id=body.case_id,
+        filename=body.filename,
+        doc_count=len(docs_json),
+    )
+
+
+@app.get("/api/v1/flagged-docs/list", response_model=list[FlaggedDocSetSummary])
+@limiter.limit(settings.api_rate_limit)
+def list_flagged_docs_endpoint(
+    request: Request,
+    case_id: str,
+    _key: str = Depends(require_api_key),
+):
+    """List all saved flagged-doc sets for a case."""
+    from app.db import list_flagged_doc_sets
+
+    engine = init_db(case_id)
+    rows = list_flagged_doc_sets(engine, case_id)
+    return [
+        FlaggedDocSetSummary(
+            id=r["id"],
+            case_id=r["case_id"],
+            filename=r["filename"],
+            query_text=r["query_text"],
+            saved_at=str(r["saved_at"]),
+            saved_by=r.get("saved_by"),
+            doc_count=r["doc_count"],
+        )
+        for r in rows
+    ]
+
+
+@app.get("/api/v1/flagged-docs/{set_id}")
+@limiter.limit(settings.api_rate_limit)
+def get_flagged_doc_set_endpoint(
+    request: Request,
+    set_id: int,
+    case_id: str,
+    _key: str = Depends(require_api_key),
+):
+    """Fetch a single saved flagged-doc set by id within a specific case."""
+    from app.db import get_flagged_doc_set
+
+    _validate_case_id(case_id)
+    engine = init_db(case_id)
+    row = get_flagged_doc_set(engine, set_id)
+    if row:
+        return {
+            "id": row["id"],
+            "case_id": row["case_id"],
+            "filename": row["filename"],
+            "query_text": row["query_text"],
+            "saved_at": str(row["saved_at"]),
+            "saved_by": row.get("saved_by"),
+            "docs": row["docs_json"],
+        }
+    raise HTTPException(status_code=404, detail="Flagged doc set not found")
+
+
+@app.delete("/api/v1/flagged-docs/{set_id}")
+@limiter.limit(settings.api_rate_limit)
+def delete_flagged_doc_set_endpoint(
+    request: Request,
+    set_id: int,
+    case_id: str,
+    _key: str = Depends(require_api_key),
+):
+    """Delete a saved flagged-doc set by id within a specific case."""
+    from app.db import delete_flagged_doc_set
+
+    _validate_case_id(case_id)
+    engine = init_db(case_id)
+    if delete_flagged_doc_set(engine, set_id):
+        return {"status": "ok", "deleted_id": set_id}
+    raise HTTPException(status_code=404, detail="Flagged doc set not found")

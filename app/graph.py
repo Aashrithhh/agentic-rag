@@ -27,9 +27,13 @@
      │  Generator  │  ← citation validation + HITL flagging
      └─────┬──────┘
            ▼
-       ┌───────┐
-       │  END  │
-       └───────┘
+  ┌─────────────────────┐
+  │ Hallucination Guard │  ← risk scoring & pass/warn/block
+  └─────────┬───────────┘
+            ▼
+        ┌───────┐
+        │  END  │
+        └───────┘
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ from langgraph.graph import END, StateGraph
 from app.config import settings
 from app.nodes.generator import generator_node
 from app.nodes.grader import grader_node
+from app.nodes.hallucination_guard import hallucination_guard_node
 from app.nodes.retriever import retriever_node
 from app.nodes.rewriter import rewriter_node
 from app.nodes.validator import validator_node
@@ -94,6 +99,7 @@ def build_graph() -> StateGraph:
     graph.add_node("rewriter", rewriter_node)
     graph.add_node("validator", validator_node)
     graph.add_node("generator", generator_node)
+    graph.add_node("hallucination_guard", hallucination_guard_node)
 
     graph.set_entry_point("intent_router")
     graph.add_edge("intent_router", "retriever")
@@ -104,7 +110,8 @@ def build_graph() -> StateGraph:
     })
     graph.add_edge("rewriter", "retriever")
     graph.add_edge("validator", "generator")
-    graph.add_edge("generator", END)
+    graph.add_edge("generator", "hallucination_guard")
+    graph.add_edge("hallucination_guard", END)
 
     return graph
 

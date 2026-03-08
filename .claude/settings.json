@@ -16,7 +16,9 @@
       "Bash(python -m pytest tests/test_resilience.py -q --tb=short)",
       "Bash(pip install openpyxl xlrd python-pptx striprtf olefile)",
       "Bash(pip install olefile)",
-      "Bash(pip show olefile)"
+      "Bash(pip show olefile)",
+      "Bash(docker exec -i audit-pgvector psql -U testuser -d audit_rag_demo_pst -c \"SELECT id, LEFT\\(body_only, 300\\) FROM document_chunks WHERE id = 211;\")",
+      "Bash(docker exec -i audit-pgvector psql -U testuser -d audit_rag_demo_pst -c \"SELECT id, email_from, LEFT\\(body_only, 200\\) FROM document_chunks WHERE id IN \\(213, 214, 220, 221\\) ORDER BY id;\")"
     ]
   }
 }

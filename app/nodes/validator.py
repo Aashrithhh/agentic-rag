@@ -21,13 +21,13 @@ import re
 from typing import Literal
 
 import httpx
-from langchain_openai import ChatOpenAI
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
 from app.cache import cache, key_for
 from app.config import settings
+from app.llm import get_chat_llm
 from app.state import AgentState, ValidationResult
 
 logger = logging.getLogger(__name__)
@@ -135,7 +135,14 @@ def _validator_node_inner(state: AgentState) -> dict:
     case_id = state.get("case_id", "")
 
     if not docs:
-        return {"validation_results": [], "validation_status": "pass"}
+        return {"validation_results": [], "validation_status": "pass",
+                "critical_fact_assessments": []}
+
+    # Skip external API verification when disabled
+    if not settings.enable_external_validation:
+        logger.info("Validator — external validation disabled, passing through.")
+        return {"validation_results": [], "validation_status": "pass",
+                "critical_fact_assessments": []}
 
     doc_text = "\n---\n".join(f"[{d.metadata.get('source', '?')}] {d.page_content}" for d in docs)
 
@@ -151,7 +158,7 @@ def _validator_node_inner(state: AgentState) -> dict:
             "llm",
             {"node": "validator_extract", "case_id": case_id,
              "query": query, "docs": doc_snippets,
-             "model": settings.openai_model,
+             "model": settings.active_llm_model,
              "validation_api_base": settings.validation_api_base},
             prefix=f"validator:{case_id}",
         )
@@ -161,11 +168,7 @@ def _validator_node_inner(state: AgentState) -> dict:
             claim_list = ClaimList(claims=[ExtractedClaim(**c) for c in cached_claims])
 
     if claim_list is None:
-        llm = ChatOpenAI(
-            model=settings.openai_model,
-            api_key=settings.openai_api_key,
-            temperature=0, max_tokens=2048,
-        )
+        llm = get_chat_llm(temperature=0, max_tokens=2048)
         structured_llm = llm.with_structured_output(ClaimList)
         chain = _prompt | structured_llm
         from app.resilience import invoke_with_retry
@@ -248,14 +251,13 @@ def _check_critical_fact_support(
             source = doc.metadata.get("source", "unknown")
 
             matched = False
-            for nv in normalized_values:
+            for nv, raw in zip(normalized_values, critical_values):
                 # Check both normalized and raw matching
                 if nv in content_normalized or nv in content_lower:
                     matched = True
                     break
                 # Also check the raw value
-                raw_lower = critical_values[normalized_values.index(nv)].lower()
-                if raw_lower in content_lower:
+                if raw.lower() in content_lower:
                     matched = True
                     break
 

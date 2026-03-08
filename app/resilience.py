@@ -190,8 +190,8 @@ def _get_fallback_chain() -> list[dict[str, str]]:
     """Return the ordered list of models to try with quality tags."""
     from app.config import settings
     return [
-        {"model": settings.openai_model, "quality": "primary", "provider": "openai"},
-        {"model": settings.fallback_model, "quality": "degraded", "provider": "openai"},
+        {"model": settings.active_llm_model, "quality": "primary", "provider": settings.llm_provider},
+        {"model": settings.fallback_model, "quality": "degraded", "provider": settings.llm_provider},
     ]
 
 
@@ -282,11 +282,10 @@ def _try_fallback_model(
         return None
 
     try:
-        from langchain_openai import ChatOpenAI
+        from app.llm import get_chat_llm
 
-        fallback_llm = ChatOpenAI(
+        fallback_llm = get_chat_llm(
             model=settings.fallback_model,
-            api_key=settings.openai_api_key,
             temperature=0,
             max_tokens=4096,
         )

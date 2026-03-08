@@ -14,7 +14,14 @@
       "Bash(REQUIRE_BLOB_SOURCE=false AZURE_STORAGE_CONNECTION_STRING=\"\" AZURE_STORAGE_SAS_URL=\"\" python -c \":*)",
       "Bash(python -c \"from app.ingest import ingest, ingest_case, embed_chunks; print\\(''All imports OK''\\)\")",
       "Bash(git restore app/audit_log.py app/config.py requirements.txt ui.py)",
-      "Bash(python -m app.ingest --case demo-pst --blob-prefix demo-pst)"
+      "Bash(python -m app.ingest --case demo-pst --blob-prefix demo-pst)",
+      "Bash(gh pr list --state all --limit 10)",
+      "Bash(gh pr list --repo Aashrithhh/agentic-rag --state all --limit 10)",
+      "Bash(docker ps --format \"table {{.Names}}\\\\t{{.Image}}\\\\t{{.Ports}}\\\\t{{.Status}}\")",
+      "Bash(docker exec audit-pgvector psql -U testuser -d audit_rag -c \"\\\\dt\")",
+      "Bash(docker exec audit-pgvector psql -U testuser -d audit_rag -c \"\\\\d document_chunks\")",
+      "Bash(docker exec audit-pgvector psql -U testuser -d audit_rag -c \"SELECT COUNT\\(*\\) FROM document_chunks;\")",
+      "Bash(docker exec audit-pgvector psql -U testuser -d audit_rag -c \"SELECT id, source, doc_type, entity_name, page, chunk_index FROM document_chunks LIMIT 10;\")"
     ]
   }
 }

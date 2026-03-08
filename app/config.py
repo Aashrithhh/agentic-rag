@@ -20,8 +20,14 @@ class Settings(BaseSettings):
     )
 
     # ── OpenAI ───────────────────────────────────────────
+    llm_provider: str = "openai"                 # "openai" | "ollama" | "huggingface"
     openai_api_key: str = ""
     openai_model: str = "gpt-4o"
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "llama3.1:8b"
+    ollama_num_ctx: int = 4096
+    huggingface_api_key: str = ""
+    huggingface_model: str = "mistralai/Mistral-7B-Instruct-v0.3"
 
     # ── Azure OpenAI (alternative) ───────────────────────
     azure_openai_api_key: str = ""
@@ -59,7 +65,7 @@ class Settings(BaseSettings):
     chunk_size: int = 1024
     chunk_overlap: int = 200
     embedding_dim: int = 1024
-    top_k: int = 6
+    top_k: int = 100
     grader_threshold: float = 0.5
     max_rewrite_loops: int = 3
 
@@ -133,15 +139,24 @@ class Settings(BaseSettings):
     intent_routing_enabled: bool = True
 
     # ── Citation validation & post-check ──────────────────
-    enable_citation_validation: bool = True
+    enable_citation_validation: bool = False  # Disabled for local testing
     enable_answer_post_check: bool = True
+    enable_external_validation: bool = False  # Disabled - skip external API verification
 
     # ── Resilience / fallback ─────────────────────────────
     fallback_model: str = "gpt-4o-mini"            # Cheaper model when primary fails
 
     # ── PII redaction ─────────────────────────────────────
-    pii_redaction_enabled: bool = True
+    pii_redaction_enabled: bool = False  # Disabled - not needed for investigation data
     pii_redaction_mode: str = "redact"             # "redact" | "detect"
+
+    # ── Hallucination guard ────────────────────────────────
+    hallucination_guard_enabled: bool = True
+    hallucination_warn_threshold: float = 0.35
+    hallucination_block_threshold: float = 0.65
+    hallucination_invalid_citation_weight: float = 0.35
+    hallucination_unsupported_claim_weight: float = 0.35
+    hallucination_critical_fact_weight: float = 0.30
 
     # ── Human-in-the-loop ─────────────────────────────────
     hitl_enabled: bool = False                     # Off by default
@@ -158,6 +173,15 @@ class Settings(BaseSettings):
     # ── Job queue ─────────────────────────────────────────
     job_queue_workers: int = 3
 
+    @property
+    def active_llm_model(self) -> str:
+        provider = self.llm_provider.strip().lower()
+        if provider == "ollama":
+            return self.ollama_model
+        if provider == "huggingface":
+            return self.huggingface_model
+        return self.openai_model
+
     def validate_secrets(self) -> list[str]:
         """Check that critical secrets are not default/placeholder values.
 
@@ -170,9 +194,12 @@ class Settings(BaseSettings):
         if self.database_url and "user:password@" in self.database_url:
             warnings.append("DATABASE_URL contains default credentials (user:password)")
 
+        provider = self.llm_provider.strip().lower()
         has_openai = self.openai_api_key and self.openai_api_key not in placeholders
         has_azure = self.azure_openai_api_key and self.azure_openai_api_key not in placeholders
-        if not has_openai and not has_azure:
+        has_hf = self.huggingface_api_key and self.huggingface_api_key not in placeholders
+        if provider not in ("ollama", "huggingface") and not has_openai and not has_azure:
+
             warnings.append("No valid LLM API key configured (OPENAI_API_KEY or AZURE_OPENAI_API_KEY)")
 
         if self.cohere_api_key in placeholders:

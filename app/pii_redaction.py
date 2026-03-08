@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Union
 
 logger = logging.getLogger(__name__)
 
@@ -216,7 +216,7 @@ def redact_pii(text: str) -> RedactionResult:
 
 
 def redact_document_chunks(
-    chunks: list[dict[str, Any]],
+    chunks: list[Union[Any, dict[str, Any]]],
     mode: Literal["redact", "detect"] = "redact",
 ) -> tuple[list, dict[str, Any]]:
     """Apply PII redaction to a batch of document chunks before indexing.
@@ -241,10 +241,16 @@ def redact_document_chunks(
 
     for chunk in chunks:
         # Handle both dict and Document objects
+        _dict_content_key = "content"  # default; overwritten for dict chunks
         if hasattr(chunk, "page_content"):
             content = chunk.page_content
         elif isinstance(chunk, dict):
-            content = chunk.get("content", chunk.get("page_content", ""))
+            # Track the original key so we write redacted text back to it
+            if "content" in chunk:
+                _dict_content_key = "content"
+            elif "page_content" in chunk:
+                _dict_content_key = "page_content"
+            content = chunk.get(_dict_content_key, "")
         else:
             content = str(chunk)
             
@@ -262,17 +268,31 @@ def redact_document_chunks(
                 if hasattr(chunk, "page_content"):
                     chunk.page_content = result.redacted_text
                     # Store PII metadata
-                    if hasattr(chunk, "metadata"):
+                    try:
+                        if not hasattr(chunk, "metadata") or chunk.metadata is None:
+                            chunk.metadata = {}
                         chunk.metadata["pii_redacted"] = True
                         chunk.metadata["pii_types"] = sorted(result.pii_types_found)
                         chunk.metadata["pii_count"] = result.total_detections
+                    except (AttributeError, TypeError) as e:
+                        logger.warning(
+                            "Could not set PII metadata on chunk %s: %s",
+                            repr(chunk)[:80], e,
+                        )
                 elif isinstance(chunk, dict):
-                    chunk["content"] = result.redacted_text
+                    chunk[_dict_content_key] = result.redacted_text
                     extra = chunk.get("metadata_extra") or {}
                     extra["pii_redacted"] = True
                     extra["pii_types"] = sorted(result.pii_types_found)
                     extra["pii_count"] = result.total_detections
                     chunk["metadata_extra"] = extra
+                else:
+                    logger.warning(
+                        "PII redaction not supported for chunk type %s — "
+                        "only detection was performed (found %d PII items). "
+                        "Original chunk returned unmodified.",
+                        type(chunk).__name__, result.total_detections,
+                    )
 
             metrics.inc("pii_detections", result.total_detections)
 

@@ -6,10 +6,13 @@ Launch:
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import logging
 import shlex
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import streamlit as st
@@ -23,6 +26,251 @@ st.set_page_config(
 )
 
 # ── Auth gate (optional password protection) ─────────────────────────
+
+
+FLAGGED_EXPORT_DIR = Path("exports/flagged")
+
+
+def _export_flagged_pdf(
+    case_id: str,
+    filename: str,
+    query_text: str,
+    docs: list[dict],
+) -> Path:
+    """Write a readable PDF of flagged documents to the local exports folder.
+
+    Returns the Path to the written PDF file.
+    """
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
+        )
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_LEFT
+    except ImportError as exc:
+        raise ImportError(
+            "The 'reportlab' package is required for PDF export. "
+            "Install it with: pip install reportlab"
+        ) from exc
+
+    out_dir = FLAGGED_EXPORT_DIR / case_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = out_dir / f"{filename}.pdf"
+
+    doc = SimpleDocTemplate(
+        str(pdf_path),
+        pagesize=A4,
+        rightMargin=0.75 * inch,
+        leftMargin=0.75 * inch,
+        topMargin=0.75 * inch,
+        bottomMargin=0.75 * inch,
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = styles["Title"]
+    heading_style = styles["Heading2"]
+    normal_style = styles["Normal"]
+    meta_style = ParagraphStyle(
+        "Meta", parent=normal_style, fontSize=8, textColor=colors.grey,
+    )
+    content_style = ParagraphStyle(
+        "Content", parent=normal_style, fontSize=9, leading=13,
+        spaceAfter=6, alignment=TA_LEFT,
+    )
+
+    story: list = []
+
+    # ── Title page ──
+    story.append(Paragraph(f"Flagged Documents — {filename}", title_style))
+    story.append(Spacer(1, 12))
+
+    summary_data = [
+        ["Case", case_id],
+        ["Saved set", filename],
+        ["Query", query_text[:200] if query_text else "(none)"],
+        ["Document count", str(len(docs))],
+        ["Exported at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+    ]
+    t = Table(summary_data, colWidths=[1.5 * inch, 4.5 * inch])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f0f0f0")),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 24))
+
+    # ── Each flagged document ──
+    for idx, d in enumerate(docs, 1):
+        meta = d.get("metadata", {})
+        source = d.get("source", meta.get("source", "unknown"))
+        subject = meta.get("email_subject", "")
+        sender = meta.get("email_from", "")
+        date = meta.get("email_date", "")
+
+        header = f"Document {idx}"
+        if subject:
+            header += f" — {subject}"
+        story.append(Paragraph(header, heading_style))
+
+        # Metadata block
+        meta_lines = []
+        if sender:
+            meta_lines.append(f"<b>From:</b> {sender}")
+        if meta.get("email_to"):
+            meta_lines.append(f"<b>To:</b> {meta['email_to']}")
+        if date:
+            meta_lines.append(f"<b>Date:</b> {date}")
+        meta_lines.append(f"<b>Source:</b> {source}")
+        if meta.get("chunk_index") is not None:
+            meta_lines.append(f"<b>Chunk:</b> {meta['chunk_index']}")
+        if meta.get("page") is not None:
+            meta_lines.append(f"<b>Page:</b> {meta['page']}")
+
+        for ml in meta_lines:
+            story.append(Paragraph(ml, meta_style))
+        story.append(Spacer(1, 8))
+
+        # Content — escape XML entities for reportlab
+        content = d.get("content", "(no content)")
+        content_safe = (
+            content.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\n", "<br/>")
+        )
+        story.append(Paragraph(content_safe, content_style))
+        story.append(Spacer(1, 16))
+
+        if idx < len(docs):
+            story.append(PageBreak())
+
+    doc.build(story)
+    return pdf_path
+
+
+# ── Natural-language save command parsing ────────────────────────────────
+
+import re as _re_cmd
+from collections import OrderedDict as _OD_cmd
+
+_SAVE_CMD_RE = _re_cmd.compile(
+    r"^\s*save\s+"
+    r"(?:docs?(?:uments?)?)\s+"
+    r"(.+?)"
+    r"\s+as\s+"
+    r"([\w\-. ]+?)"
+    r"\s*$",
+    _re_cmd.IGNORECASE,
+)
+_RANGE_RE = _re_cmd.compile(r"(\d+)\s*[-\u2013\u2014]\s*(\d+)")
+_SINGLE_RE = _re_cmd.compile(r"\d+")
+
+
+def _parse_save_command(text: str, max_card: int):
+    """Regex parser for save commands. Returns (doc_numbers, filename) or None."""
+    m = _SAVE_CMD_RE.match(text)
+    if not m:
+        return None
+    spec, filename = m.group(1), m.group(2).strip()
+
+    nums: list[int] = []
+    remainder = spec
+    for rm in _RANGE_RE.finditer(spec):
+        lo, hi = int(rm.group(1)), int(rm.group(2))
+        if lo <= hi:
+            nums.extend(range(lo, hi + 1))
+        remainder = remainder.replace(rm.group(0), " ")
+    for sm in _SINGLE_RE.finditer(remainder):
+        nums.append(int(sm.group(0)))
+
+    nums = sorted(set(nums))
+    if not nums or not filename:
+        return None
+    return (nums, filename)
+
+
+def _llm_parse_save_command(text: str, max_card: int):
+    """LLM fallback for parsing save commands regex cannot handle."""
+    from pydantic import BaseModel, Field
+    from app.llm import get_chat_llm
+
+    class SaveCommandExtraction(BaseModel):
+        doc_numbers: list[int] = Field(description="Document numbers to save (1-based)")
+        filename: str = Field(description="Filename to save as")
+        is_save_command: bool = Field(description="Whether this is a save command")
+
+    llm = get_chat_llm(temperature=0, max_tokens=256)
+    chain = llm.with_structured_output(SaveCommandExtraction)
+    prompt = (
+        f"The user typed a command in a document-saving interface. "
+        f"There are {max_card} documents numbered 1 to {max_card}. "
+        f"Extract the document numbers and filename from this command. "
+        f"If this is not a save command, set is_save_command to false.\n\n"
+        f"Command: {text}"
+    )
+    try:
+        result = chain.invoke(prompt)
+        if not result.is_save_command:
+            return None
+        nums = sorted(set(result.doc_numbers))
+        if not nums or not result.filename.strip():
+            return None
+        return (nums, result.filename.strip())
+    except Exception:
+        return None
+
+
+def _build_card_docs_map(retrieved_docs: list) -> dict[int, dict]:
+    """Build card_num → payload dict mapping from retrieved documents.
+
+    Uses the same ordering as the UI: email groups first, then standalone docs.
+    """
+    email_grps: OrderedDict[str, list] = OrderedDict()
+    standalone: list[tuple[int, object]] = []
+    for di, d in enumerate(retrieved_docs):
+        ef = d.metadata.get("email_from", "")
+        es = d.metadata.get("email_subject", "")
+        mid = d.metadata.get("message_id", "")
+        if ef or es:
+            gk = mid or f"{es}||{ef}"
+            if gk not in email_grps:
+                email_grps[gk] = []
+            email_grps[gk].append((di, d))
+        else:
+            standalone.append((di, d))
+
+    card_docs: dict[int, dict] = {}
+    cn = 0
+    for _gk, cl in email_grps.items():
+        cn += 1
+        cl.sort(key=lambda t: t[1].metadata.get("chunk_index") or 0)
+        merged_content = "\n\n".join(c.page_content for _, c in cl)
+        first = cl[0][1]
+        card_docs[cn] = {
+            "source": first.metadata.get("source", ""),
+            "page": first.metadata.get("page"),
+            "chunk_index": first.metadata.get("chunk_index"),
+            "content": merged_content[:5000],
+            "metadata": {k: str(v) if v is not None else None for k, v in first.metadata.items()},
+        }
+    for _, sd in standalone:
+        cn += 1
+        card_docs[cn] = {
+            "source": sd.metadata.get("source", ""),
+            "page": sd.metadata.get("page"),
+            "chunk_index": sd.metadata.get("chunk_index"),
+            "content": sd.page_content[:5000],
+            "metadata": {k: str(v) if v is not None else None for k, v in sd.metadata.items()},
+        }
+    return card_docs
 
 
 def _check_auth() -> None:
@@ -347,6 +595,14 @@ with st.sidebar:
 # Ingestion helpers (threaded background ingestion for Streamlit)
 # ─────────────────────────────────────────────────────────────────────
 
+# Thread-safe store for ingestion results (background thread writes here,
+# main Streamlit thread reads via _get_ingest_result).
+import threading as _threading
+
+_ingest_results_lock = _threading.Lock()
+_ingest_results: dict[str, dict] = {}
+
+
 def _get_chunk_count(case_id: str) -> int:
     """Return number of chunks in a case's database."""
     try:
@@ -362,14 +618,32 @@ def _get_chunk_count(case_id: str) -> int:
 
 
 def _run_ingest_thread(case_id: str, source_path: str, result_key: str) -> None:
-    """Run ingestion in a background thread so Streamlit doesn't freeze."""
+    """Run ingestion in a background thread so Streamlit doesn't freeze.
+
+    Writes outcome to a thread-safe store — never touches st.session_state directly.
+    """
+    with _ingest_results_lock:
+        _ingest_results[result_key] = {"status": "running", "message": "Ingestion in progress..."}
     try:
         from app.ingest import ingest_case
-        st.session_state[result_key] = {"status": "running", "message": "Ingestion in progress..."}
         result = ingest_case(case_id, source_path)
-        st.session_state[result_key] = {"status": "completed", "result": result}
+        with _ingest_results_lock:
+            _ingest_results[result_key] = {"status": "completed", "result": result}
     except Exception as exc:
-        st.session_state[result_key] = {"status": "failed", "error": str(exc)}
+        with _ingest_results_lock:
+            _ingest_results[result_key] = {"status": "failed", "error": str(exc)}
+
+
+def _get_ingest_result(result_key: str) -> dict | None:
+    """Poll the thread-safe store and transfer result to session_state.
+
+    Called from the main Streamlit thread only.
+    """
+    with _ingest_results_lock:
+        result = _ingest_results.pop(result_key, None)
+    if result is not None:
+        st.session_state[result_key] = result
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -378,11 +652,12 @@ def _run_ingest_thread(case_id: str, source_path: str, result_key: str) -> None:
 
 
 NODE_META: dict[str, dict[str, str]] = {
-    "retriever": {"icon": "📥", "label": "Retriever",  "desc": "Hybrid semantic + keyword search via Cohere & pgvector"},
-    "grader":    {"icon": "⚖️",  "label": "Grader",     "desc": "LLM-based binary relevance check (GPT-4o)"},
-    "rewriter":  {"icon": "✏️",  "label": "Rewriter",   "desc": "Query reformulation for better recall"},
-    "validator": {"icon": "🛡️", "label": "Validator",  "desc": "Cross-verify extracted claims against external APIs"},
-    "generator": {"icon": "📝", "label": "Generator",  "desc": "Audit-ready answer synthesis with citations"},
+    "retriever":           {"icon": "📥", "label": "Retriever",           "desc": "Hybrid semantic + keyword search via Cohere & pgvector"},
+    "grader":              {"icon": "⚖️",  "label": "Grader",             "desc": "LLM-based binary relevance check (GPT-4o)"},
+    "rewriter":            {"icon": "✏️",  "label": "Rewriter",           "desc": "Query reformulation for better recall"},
+    "validator":           {"icon": "🛡️", "label": "Validator",          "desc": "Cross-verify extracted claims against external APIs"},
+    "generator":           {"icon": "📝", "label": "Generator",          "desc": "Audit-ready answer synthesis with citations"},
+    "hallucination_guard": {"icon": "🔬", "label": "Hallucination Guard", "desc": "Risk scoring & pass/warn/block policy"},
 }
 
 
@@ -430,6 +705,18 @@ def render_step_card(node: str, data: dict[str, Any], css_class: str = "done"):
     elif node == "generator":
         answer = data.get("answer", "")
         detail_html = f"Produced <strong>{len(answer):,}</strong>-character answer"
+
+    elif node == "hallucination_guard":
+        h_decision = data.get("hallucination_decision", "pass")
+        h_score = data.get("hallucination_score", 0.0)
+        badge_map = {"pass": ("✅ PASS", "done"), "warn": ("⚠️ WARN", "fail"), "block": ("🚫 BLOCK", "fail")}
+        badge_text, css_class = badge_map.get(h_decision, ("✅ PASS", "done"))
+        detail_html = f"Decision: <strong>{badge_text}</strong> &mdash; score: {h_score:.2f}"
+        h_flags = data.get("hallucination_flags", [])
+        if h_flags:
+            detail_html += "<br/>" + "<br/>".join(
+                f"• {_esc(f.get('detail', ''))}" for f in h_flags
+            )
 
     st.markdown(f"""
     <div class="step-card {css_class}">
@@ -491,12 +778,24 @@ with tab_query:
         if st.button("🗑  Clear history"):
             st.session_state.pop("steps", None)
             st.session_state.pop("final_answer", None)
+            st.session_state.pop("final_state", None)
+            # Clear stale flag checkbox state
+            for _fk in [k for k in st.session_state if k.startswith("flag_doc_")]:
+                del st.session_state[_fk]
+            st.session_state.pop("_flag_card_count", None)
+            st.session_state.pop("flag_save_filename", None)
             st.rerun()
 
     # ─────────────────────────────────────────────────────────────────────
     # Execute pipeline
     # ─────────────────────────────────────────────────────────────────────
     if run_clicked and query.strip():
+        # ── Clear stale flag state from previous query ─────────
+        for _fk in [k for k in st.session_state if k.startswith("flag_doc_")]:
+            del st.session_state[_fk]
+        st.session_state.pop("_flag_card_count", None)
+        st.session_state.pop("flag_save_filename", None)
+
         # ── Input validation ───────────────────────────────────────
         if len(query.strip()) > settings.ui_max_query_length:
             st.error(f"Query too long ({len(query.strip())} chars). Max is {settings.ui_max_query_length}.")
@@ -579,6 +878,11 @@ with tab_query:
         loops = final_state.get("loop_count", 0)
         answer_len = len(final_state.get("answer", ""))
 
+        h_decision = final_state.get("hallucination_decision", "pass")
+        h_score = final_state.get("hallucination_score", 0.0)
+        h_badge_color = {"pass": "#34c759", "warn": "#ff9500", "block": "#ff3b30"}.get(h_decision, "#34c759")
+        h_badge_label = h_decision.upper()
+
         st.markdown(f"""
         <div class="metric-row">
             <span class="metric-pill">📥 {n_docs} docs retrieved</span>
@@ -587,6 +891,7 @@ with tab_query:
             <span class="metric-pill">🔄 Rewrites: {loops}</span>
             <span class="metric-pill">⏱️ {elapsed:.1f}s</span>
             <span class="metric-pill">📏 {answer_len:,} chars</span>
+            <span class="metric-pill" style="background:{h_badge_color}22;border:1px solid {h_badge_color}">🔬 Risk: {h_badge_label} ({h_score:.2f})</span>
         </div>
         """, unsafe_allow_html=True)
 
@@ -601,19 +906,40 @@ with tab_query:
         with col_answer:
             st.markdown("#### Answer")
             answer = st.session_state.get("final_answer", "")
-            if answer:
+
+            h_decision = final_state.get("hallucination_decision", "pass")
+            h_score_val = final_state.get("hallucination_score", 0.0)
+            h_flags = final_state.get("hallucination_flags", [])
+
+            if h_decision == "block":
+                st.error(
+                    f"**Answer Blocked** (hallucination risk score: {h_score_val:.2f})\n\n"
+                    "The system detected a high risk of hallucination. "
+                    "Please refine your query or consult the source documents directly."
+                )
+                if h_flags:
+                    with st.expander("🔬 Hallucination Risk Details", expanded=True):
+                        for hf in h_flags:
+                            st.warning(f"**{hf.get('type', 'unknown')}:** {hf.get('detail', '')}")
+            elif answer:
+                if h_decision == "warn":
+                    st.warning(f"**Hallucination Warning** (risk score: {h_score_val:.2f})")
+
                 st.markdown(f'<div class="answer-box">', unsafe_allow_html=True)
                 st.markdown(answer)
                 st.markdown('</div>', unsafe_allow_html=True)
 
-                # Validation warning
+                if h_flags:
+                    with st.expander("🔬 Hallucination Risk Details", expanded=False):
+                        for hf in h_flags:
+                            st.info(f"**{hf.get('type', 'unknown')}:** {hf.get('detail', '')}")
+
                 if final_state.get("validation_status") in ("partial", "fail"):
                     st.warning(
                         f"Validation status: **{final_state['validation_status'].upper()}** "
                         "— some claims could not be verified. See discrepancy notes above."
                     )
 
-                # Critical fact warnings
                 critical_facts = final_state.get("critical_fact_assessments", [])
                 weak_facts = [a for a in critical_facts if not a.get("is_sufficiently_supported")]
                 if weak_facts:
@@ -629,37 +955,322 @@ with tab_query:
             else:
                 st.info("No answer was generated.")
 
-        # ── Expandable: retrieved documents ──
+        # ── Expandable: retrieved documents with flag checkboxes ──
         with st.expander("📄 Retrieved Documents", expanded=False):
+            import html as _html
+            import re as _re
+            from collections import OrderedDict
+
             docs = final_state.get("retrieved_docs", [])
-            for i, doc in enumerate(docs, 1):
-                src = doc.metadata.get("source", "unknown")
-                page = doc.metadata.get("page", "?")
+
+            # ── Group email chunks by message_id (or subject+from fallback) ──
+            # Non-email docs get their own group (keyed by index)
+            email_groups: OrderedDict[str, list] = OrderedDict()
+            standalone: list[tuple[int, object]] = []  # (original_index, doc)
+
+            for idx, doc in enumerate(docs):
                 email_from = doc.metadata.get("email_from", "")
                 email_subject = doc.metadata.get("email_subject", "")
-                chunk_type = doc.metadata.get("chunk_type", "")
-                is_stitched = doc.metadata.get("is_stitched", False)
-                is_att = doc.metadata.get("is_attachment_context", False)
-                boost = doc.metadata.get("metadata_boost", 0)
+                message_id = doc.metadata.get("message_id", "")
+                is_email = bool(email_from or email_subject)
 
-                # Build info line
-                info_parts = [f"`{src}` (page {page})"]
+                if is_email:
+                    # Group key: prefer message_id, fall back to subject+from
+                    group_key = message_id or f"{email_subject}||{email_from}"
+                    if group_key not in email_groups:
+                        email_groups[group_key] = []
+                    email_groups[group_key].append((idx, doc))
+                else:
+                    standalone.append((idx, doc))
+
+            # ── Render grouped emails ──
+            card_num = 0
+            for group_key, chunk_list in email_groups.items():
+                card_num += 1
+                # Sort chunks by chunk_index so they assemble in order
+                chunk_list.sort(key=lambda t: t[1].metadata.get("chunk_index") or 0)
+
+                # Use metadata from first chunk for the email header
+                first_doc = chunk_list[0][1]
+                src = first_doc.metadata.get("source", "unknown")
+                page = first_doc.metadata.get("page", "?")
+                email_from = first_doc.metadata.get("email_from", "")
+                email_to = first_doc.metadata.get("email_to", "")
+                email_subject = first_doc.metadata.get("email_subject", "")
+                email_date = first_doc.metadata.get("email_date", "")
+
+                # Collect badges and flags across all chunks in this group
+                has_stitched = any(d.metadata.get("is_stitched") for _, d in chunk_list)
+                has_att = any(d.metadata.get("is_attachment_context") for _, d in chunk_list)
+                max_boost = max((d.metadata.get("metadata_boost", 0) for _, d in chunk_list), default=0)
+                chunk_types = list(OrderedDict.fromkeys(
+                    d.metadata.get("chunk_type", "") for _, d in chunk_list if d.metadata.get("chunk_type")
+                ))
+                num_chunks = len(chunk_list)
+
+                badges = f'<span style="background:#e8f4fd;border:1px solid #b8ddf0;border-radius:5px;padding:2px 8px;font-size:0.78rem;margin-right:4px">📄 {_html.escape(str(src))}</span>'
+                badges += f'<span style="background:#f0faf3;border:1px solid #a8ddb8;border-radius:5px;padding:2px 8px;font-size:0.78rem;margin-right:4px">p.{page}</span>'
+                if num_chunks > 1:
+                    badges += f'<span style="background:#e3f2fd;border:1px solid #90caf9;border-radius:5px;padding:2px 8px;font-size:0.78rem;margin-right:4px">📧 {num_chunks} chunks assembled</span>'
+                for ct in chunk_types:
+                    chunk_color = {"email_header": "#fff3cd", "email_body": "#f0f7ff", "list": "#f5f0ff"}.get(ct, "#f8f8f8")
+                    chunk_border = {"email_header": "#ffc107", "email_body": "#4a9eff", "list": "#9b59b6"}.get(ct, "#ccc")
+                    badges += f'<span style="background:{chunk_color};border:1px solid {chunk_border};border-radius:5px;padding:2px 8px;font-size:0.78rem;margin-right:4px">{ct}</span>'
+                if has_stitched:
+                    badges += '<span style="background:#fff0f5;border:1px solid #ffb3cc;border-radius:5px;padding:2px 8px;font-size:0.78rem;margin-right:4px">🔗 stitched</span>'
+                if has_att:
+                    badges += '<span style="background:#fff8e1;border:1px solid #ffcc02;border-radius:5px;padding:2px 8px;font-size:0.78rem;margin-right:4px">📎 attachment</span>'
+                if max_boost > 0:
+                    badges += f'<span style="background:#e8f5e9;border:1px solid #81c784;border-radius:5px;padding:2px 8px;font-size:0.78rem">⬆ boost={max_boost:.2f}</span>'
+
+                # ── Flag checkbox for this email group ──
+                st.checkbox(
+                    f"🚩 Flag Document {card_num}",
+                    key=f"flag_doc_{card_num}",
+                    value=st.session_state.get(f"flag_doc_{card_num}", False),
+                )
+
+                # ── Assemble full email body from all chunks ──
+                body_parts: list[str] = []
+                for _, chunk_doc in chunk_list:
+                    _raw = chunk_doc.page_content
+                    _lines = _raw.splitlines()
+                    _clean_lines: list[str] = []
+                    for _ln in _lines:
+                        _s = _ln.strip().rstrip('\r')
+                        if _re.match(
+                            r'^(From|To|Cc|CC|Bcc|BCC|Date|Subject|Sent|Importance|Attachments)\s*:',
+                            _s,
+                        ):
+                            continue
+                        _clean_lines.append(_ln)
+                    cleaned = "\n".join(_clean_lines).strip()
+                    if cleaned:
+                        body_parts.append(cleaned)
+
+                display_body = "\n\n".join(body_parts)
+
+                header_rows = ""
                 if email_from:
-                    info_parts.append(f"📤 {email_from}")
+                    header_rows += f'<tr><td style="color:#888;font-size:0.82rem;padding:2px 8px 2px 0;white-space:nowrap;font-weight:600">From</td><td style="font-size:0.85rem;padding:2px 0">{_html.escape(email_from)}</td></tr>'
+                if email_to:
+                    header_rows += f'<tr><td style="color:#888;font-size:0.82rem;padding:2px 8px 2px 0;white-space:nowrap;font-weight:600">To</td><td style="font-size:0.85rem;padding:2px 0">{_html.escape(str(email_to)[:120])}</td></tr>'
+                if email_date:
+                    header_rows += f'<tr><td style="color:#888;font-size:0.82rem;padding:2px 8px 2px 0;white-space:nowrap;font-weight:600">Date</td><td style="font-size:0.85rem;padding:2px 0">{_html.escape(str(email_date)[:40])}</td></tr>'
                 if email_subject:
-                    info_parts.append(f"📋 {email_subject}")
-                if chunk_type:
-                    info_parts.append(f"🏷️ {chunk_type}")
-                if is_stitched:
-                    info_parts.append("🔗 *stitched*")
-                if is_att:
-                    info_parts.append("📎 *attachment*")
-                if boost > 0:
-                    info_parts.append(f"⬆️ boost={boost:.2f}")
+                    header_rows += f'<tr><td style="color:#888;font-size:0.82rem;padding:2px 8px 2px 0;white-space:nowrap;font-weight:600">Subject</td><td style="font-size:0.85rem;padding:2px 0;font-weight:600">{_html.escape(email_subject)}</td></tr>'
 
-                st.markdown(f"**Document {i}** — {' | '.join(info_parts)}")
-                st.text(doc.page_content[:500])
-                st.markdown("---")
+                body_html = _html.escape(display_body).replace("\n", "<br>")
+
+                st.markdown(f"""
+<div style="margin-bottom:1rem">
+  <div style="margin-bottom:6px"><strong>Document {card_num}</strong> &nbsp; {badges}</div>
+  <div style="border:1px solid #d0d7de;border-radius:10px;overflow:hidden;font-family:sans-serif">
+    <div style="background:#f6f8fa;padding:10px 14px;border-bottom:1px solid #d0d7de">
+      <table style="border-collapse:collapse;width:100%">{header_rows}</table>
+    </div>
+    <div style="padding:12px 14px;background:#ffffff;font-size:0.88rem;line-height:1.6;color:#24292f;white-space:pre-wrap">{body_html}</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+            # ── Render standalone (non-email) documents ──
+            for _, doc in standalone:
+                card_num += 1
+                src = doc.metadata.get("source", "unknown")
+                page = doc.metadata.get("page", "?")
+                badges = f'<span style="background:#e8f4fd;border:1px solid #b8ddf0;border-radius:5px;padding:2px 8px;font-size:0.78rem;margin-right:4px">📄 {_html.escape(str(src))}</span>'
+                badges += f'<span style="background:#f0faf3;border:1px solid #a8ddb8;border-radius:5px;padding:2px 8px;font-size:0.78rem;margin-right:4px">p.{page}</span>'
+                body_html = _html.escape(doc.page_content[:500]).replace("\n", "<br>")
+
+                # ── Flag checkbox for this standalone doc ──
+                st.checkbox(
+                    f"🚩 Flag Document {card_num}",
+                    key=f"flag_doc_{card_num}",
+                    value=st.session_state.get(f"flag_doc_{card_num}", False),
+                )
+
+                st.markdown(f"""
+<div style="margin-bottom:1rem">
+  <div style="margin-bottom:6px"><strong>Document {card_num}</strong> &nbsp; {badges}</div>
+  <div style="border:1px solid #d0d7de;border-radius:10px;padding:12px 14px;background:#fafafa;font-size:0.88rem;line-height:1.6;color:#24292f">{body_html}</div>
+</div>
+""", unsafe_allow_html=True)
+
+            # Stash total card count for the save section below
+            st.session_state["_flag_card_count"] = card_num
+
+            # ── Quick Save Command Bar ──────────────────────────────────
+            st.markdown("---")
+            st.markdown("**Quick Save Command**")
+            _cmd_text = st.text_input(
+                "Type a save command",
+                key="save_command_bar",
+                placeholder='e.g. "Save doc 1 and 3 as suspicious_batch"',
+                label_visibility="collapsed",
+            )
+            if st.button("⚡ Run Command", key="run_save_cmd"):
+                if not _cmd_text or not _cmd_text.strip():
+                    st.warning("Please type a command first.")
+                else:
+                    _max_card = card_num
+                    _parsed = _parse_save_command(_cmd_text.strip(), _max_card)
+
+                    if _parsed is None:
+                        with st.spinner("Parsing command with LLM..."):
+                            _parsed = _llm_parse_save_command(_cmd_text.strip(), _max_card)
+
+                    if _parsed is None:
+                        st.error(
+                            'Could not parse your command. Try: **save doc 1, 2 as filename**'
+                        )
+                    else:
+                        _cmd_nums, _cmd_fname = _parsed
+
+                        # Validate doc numbers
+                        _bad = [n for n in _cmd_nums if n < 1 or n > _max_card]
+                        if _bad:
+                            st.error(
+                                f"Document(s) {_bad} out of range. There are {_max_card} documents."
+                            )
+                        elif not _re_cmd.match(r'^[\w\-. ]+$', _cmd_fname):
+                            st.error(
+                                "Filename may only contain letters, digits, hyphens, underscores, dots, and spaces."
+                            )
+                        else:
+                            _all_docs = final_state.get("retrieved_docs", [])
+                            _cmd_card_map = _build_card_docs_map(_all_docs)
+                            _cmd_payloads = [_cmd_card_map[n] for n in _cmd_nums if n in _cmd_card_map]
+
+                            if not _cmd_payloads:
+                                st.error("No documents could be collected for those numbers.")
+                            else:
+                                try:
+                                    from app.db import save_flagged_doc_set
+                                    _cmd_engine = init_db(selected_case.case_id)
+                                    _cmd_query = st.session_state.get("query_text", "")
+                                    _cmd_id = save_flagged_doc_set(
+                                        _cmd_engine,
+                                        case_id=selected_case.case_id,
+                                        filename=_cmd_fname,
+                                        query_text=_cmd_query,
+                                        docs_json=_cmd_payloads,
+                                    )
+                                    try:
+                                        _cmd_pdf = _export_flagged_pdf(
+                                            case_id=selected_case.case_id,
+                                            filename=_cmd_fname,
+                                            query_text=_cmd_query,
+                                            docs=_cmd_payloads,
+                                        )
+                                        st.success(
+                                            f"✅ Saved doc(s) {_cmd_nums} as **{_cmd_fname}** (id={_cmd_id})\n\n"
+                                            f"📄 PDF exported to `{_cmd_pdf}`"
+                                        )
+                                    except Exception as _pdf_e:
+                                        st.success(
+                                            f"✅ Saved doc(s) {_cmd_nums} as **{_cmd_fname}** (id={_cmd_id})"
+                                        )
+                                        st.warning(f"⚠️ PDF export failed: {_pdf_e}")
+                                except Exception as _cmd_exc:
+                                    if "uq_saved_flagged_docs_case_filename" in str(_cmd_exc):
+                                        st.error(f"A file named **{_cmd_fname}** already exists for this case.")
+                                    else:
+                                        st.error(f"Save failed: {_cmd_exc}")
+
+        # ── Save Flagged Documents section ──────────────────────────────
+        _total_cards = st.session_state.get("_flag_card_count", 0)
+        _flagged_indices = [
+            i for i in range(1, _total_cards + 1)
+            if st.session_state.get(f"flag_doc_{i}", False)
+        ]
+
+        if _flagged_indices:
+            st.markdown(f"**🚩 {len(_flagged_indices)} document(s) flagged**")
+
+            _flag_filename = st.text_input(
+                "Filename for saved set",
+                key="flag_save_filename",
+                placeholder="e.g. suspicious_emails_batch1",
+            )
+
+            if st.button("💾 Save Flagged Documents", type="primary"):
+                if not _flag_filename or not _flag_filename.strip():
+                    st.error("Please enter a filename.")
+                else:
+                    import re as _re_val
+                    _fname = _flag_filename.strip()
+                    if not _re_val.match(r'^[\w\-. ]+$', _fname):
+                        st.error("Filename may only contain letters, digits, hyphens, underscores, dots, and spaces.")
+                    else:
+                        # Build flagged doc payloads using shared helper
+                        _all_docs = final_state.get("retrieved_docs", [])
+                        _card_docs = _build_card_docs_map(_all_docs)
+                        _flagged_payloads = [_card_docs[i] for i in _flagged_indices if i in _card_docs]
+
+                        if not _flagged_payloads:
+                            st.error("No flagged documents could be collected.")
+                        else:
+                            try:
+                                from app.db import save_flagged_doc_set
+                                _save_engine = init_db(selected_case.case_id)
+                                _query_text = st.session_state.get("query_text", "")
+                                _new_id = save_flagged_doc_set(
+                                    _save_engine,
+                                    case_id=selected_case.case_id,
+                                    filename=_fname,
+                                    query_text=_query_text,
+                                    docs_json=_flagged_payloads,
+                                )
+                                # Also export as local PDF
+                                try:
+                                    _pdf_path = _export_flagged_pdf(
+                                        case_id=selected_case.case_id,
+                                        filename=_fname,
+                                        query_text=_query_text,
+                                        docs=_flagged_payloads,
+                                    )
+                                    st.success(
+                                        f"✅ Saved {len(_flagged_payloads)} flagged doc(s) as **{_fname}** (id={_new_id})\n\n"
+                                        f"📄 PDF exported to `{_pdf_path}`"
+                                    )
+                                except Exception as _pdf_exc:
+                                    st.success(
+                                        f"✅ Saved {len(_flagged_payloads)} flagged doc(s) as **{_fname}** (id={_new_id})"
+                                    )
+                                    st.warning(f"⚠️ PDF export failed: {_pdf_exc}")
+                            except Exception as _save_exc:
+                                if "uq_saved_flagged_docs_case_filename" in str(_save_exc):
+                                    st.error(f"A file named **{_fname}** already exists for this case. Choose a different name.")
+                                else:
+                                    st.error(f"Save failed: {_save_exc}")
+
+        # ── View saved flagged doc sets ──────────────────────────────
+        with st.expander("📂 Saved Flagged Documents", expanded=False):
+            try:
+                from app.db import list_flagged_doc_sets, get_flagged_doc_set
+                _view_engine = init_db(selected_case.case_id)
+                _saved_sets = list_flagged_doc_sets(_view_engine, selected_case.case_id)
+                if _saved_sets:
+                    for _ss in _saved_sets:
+                        _scol1, _scol2, _scol3 = st.columns([3, 1, 1])
+                        with _scol1:
+                            st.markdown(f"**{_ss['filename']}** — {_ss['doc_count']} docs — {str(_ss['saved_at'])[:19]}")
+                        with _scol2:
+                            if st.button("View", key=f"view_saved_{_ss['id']}"):
+                                _detail = get_flagged_doc_set(_view_engine, _ss["id"])
+                                if _detail:
+                                    st.session_state[f"_saved_detail_{_ss['id']}"] = _detail
+                        with _scol3:
+                            st.caption(f"Query: {_ss['query_text'][:60]}...")
+                        # Show detail if loaded
+                        if f"_saved_detail_{_ss['id']}" in st.session_state:
+                            _det = st.session_state[f"_saved_detail_{_ss['id']}"]
+                            st.json(_det["docs_json"])
+                else:
+                    st.caption("No saved flagged document sets for this case.")
+            except Exception as _view_exc:
+                st.warning(f"Could not load saved sets: {_view_exc}")
 
         # ── Expandable: validation details ──
         v_results = final_state.get("validation_results", [])
@@ -766,6 +1377,8 @@ with tab_ingest:
             st.rerun()
 
     # ── Show ingestion result / progress ─────────────────────────
+    # Transfer any background-thread result into session_state
+    _get_ingest_result(ingest_key)
     ingest_state = st.session_state.get(ingest_key, None)
 
     if ingest_state:

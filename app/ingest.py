@@ -48,7 +48,7 @@ from pypdf import PdfReader
 
 from app.blob_storage import is_blob_mode, iter_files_for_source
 from app.config import settings
-from app.db import init_db, upsert_chunks
+from app.db import init_db, upsert_chunks, upsert_pst_email_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +113,9 @@ _ALL_SUPPORTED = {
 _ZIP_MAX_NESTING_DEPTH = 2
 _ZIP_MAX_TOTAL_BYTES = 500 * 1024 * 1024   # 500 MB
 _ZIP_MAX_FILE_COUNT = 10_000
-_zip_current_depth = 0
+
+# ── JSON flattening depth limit ────────────────────────────────────
+_JSON_MAX_DEPTH = 50
 
 # ── CSV/TSV batching ──────────────────────────────────────────────
 _CSV_BATCH_SIZE = 50
@@ -689,6 +691,45 @@ def load_msg(doc_source: str) -> list[Document]:
 # ─────────────────────────────────────────────────────────────────────
 #  7. Outlook PST loader (Windows only — uses Outlook COM)
 # ─────────────────────────────────────────────────────────────────────
+
+# Module-level accumulator: populated by _extract_pst_folder, consumed by ingest().
+_pst_metadata_rows: list[dict] = []
+
+
+def _derive_message_id(item, pst_name: str, index: int) -> str:
+    """Derive a stable MessageId with fallback chain:
+    1) Internet Message-ID header (PR_INTERNET_MESSAGE_ID)
+    2) Outlook EntryID
+    3) Deterministic hash from subject + sender + date
+    """
+    # Try internet message id via MAPI property
+    try:
+        pr_internet_msg_id = "http://schemas.microsoft.com/mapi/proptag/0x1035001F"
+        internet_id = item.PropertyAccessor.GetProperty(pr_internet_msg_id)
+        if internet_id and internet_id.strip():
+            return internet_id.strip()
+    except Exception:
+        pass
+
+    # Fallback: EntryID
+    entry_id = getattr(item, "EntryID", "")
+    if entry_id:
+        return entry_id
+
+    # Fallback: deterministic hash
+    import hashlib
+    raw = f"{pst_name}|{getattr(item, 'Subject', '')}|{getattr(item, 'SenderName', '')}|{getattr(item, 'ReceivedTime', '')}|{index}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _derive_sender_email(item) -> str:
+    """Extract sender email address with fallback to empty string."""
+    try:
+        return getattr(item, "SenderEmailAddress", "") or ""
+    except Exception:
+        return ""
+
+
 def load_pst(doc_source: str) -> list[Document]:
     """Load .pst Outlook data files via Outlook COM automation (Windows only).
 
@@ -775,6 +816,17 @@ def _extract_pst_folder(folder, pst_name: str, docs: list[Document], max_emails:
                     parts.append(f"Date: {getattr(item, 'ReceivedTime', '')}")
                     parts.append(f"Subject: {getattr(item, 'Subject', '')}")
                     body = getattr(item, "Body", "") or ""
+                    # Strip leading email headers from Outlook Body to get pure body
+                    _body_lines = body.splitlines()
+                    _body_start = 0
+                    for _bl_idx, _bl in enumerate(_body_lines):
+                        stripped = _bl.strip().rstrip('\r')
+                        if stripped and not re.match(
+                            r'^(From|To|Cc|CC|Bcc|BCC|Date|Subject|Sent|Importance|Attachments)\s*:', stripped
+                        ):
+                            _body_start = _bl_idx
+                            break
+                    pure_body = "\n".join(_body_lines[_body_start:]).strip()
                     if body.strip():
                         parts.append(f"\n{body}")
 
@@ -837,8 +889,34 @@ def _extract_pst_folder(folder, pst_name: str, docs: list[Document], max_emails:
                                 "folder": folder.Name,
                                 "attachments": ", ".join(att_names) if att_names else "",
                                 "attachment_names": ", ".join(att_names) if att_names else "",
+                                "body_only": pure_body,
                             },
                         ))
+
+                        # ── Collect PST email metadata row ──────────
+                        try:
+                            stable_msg_id = _derive_message_id(item, pst_name, i)
+                            html_body = ""
+                            try:
+                                html_body = getattr(item, "HTMLBody", "") or ""
+                            except Exception:
+                                pass
+                            _pst_metadata_rows.append({
+                                "PstFileId": pst_name,
+                                "Subject": getattr(item, "Subject", "") or "",
+                                "SenderName": getattr(item, "SenderName", "") or "",
+                                "SenderEmail": _derive_sender_email(item),
+                                "RecipientTo": getattr(item, "To", "") or "",
+                                "RecipientCc": getattr(item, "CC", "") or "",
+                                "SentDate": str(getattr(item, "ReceivedTime", "")),
+                                "BodyText": body,
+                                "BodyHtml": html_body,
+                                "HasAttachments": len(att_names) > 0,
+                                "FolderPath": folder.Name,
+                                "MessageId": stable_msg_id,
+                            })
+                        except Exception as meta_exc:
+                            logger.warning("Failed to collect PST metadata for email %d in %s: %s", i, pst_name, meta_exc)
 
                         # Create separate attachment Documents with parent_message_id
                         if settings.attachment_context_link and att_names:
@@ -879,13 +957,15 @@ def _extract_pst_folder(folder, pst_name: str, docs: list[Document], max_emails:
 # ─────────────────────────────────────────────────────────────────────
 #  8. Purview eDiscovery export loader (JSON / CSV)
 # ─────────────────────────────────────────────────────────────────────
-def _flatten_json_for_text(value: object) -> str:
+def _flatten_json_for_text(value: object, depth: int = 0) -> str:
     """Convert JSON-like data into readable text for chunking/embedding."""
+    if depth >= _JSON_MAX_DEPTH:
+        return "[truncated]"
     if isinstance(value, dict):
         lines: list[str] = []
         for key, val in value.items():
             if isinstance(val, (dict, list)):
-                child = _flatten_json_for_text(val)
+                child = _flatten_json_for_text(val, depth + 1)
                 if child:
                     lines.append(f"{key}:")
                     lines.append(child)
@@ -893,7 +973,7 @@ def _flatten_json_for_text(value: object) -> str:
                 lines.append(f"{key}: {val}")
         return "\n".join(lines)
     if isinstance(value, list):
-        return "\n".join(_flatten_json_for_text(item) for item in value)
+        return "\n".join(_flatten_json_for_text(item, depth + 1) for item in value)
     return str(value)
 
 
@@ -1199,7 +1279,11 @@ def load_doc(doc_source: str) -> list[Document]:
 
 def load_xml(doc_source: str) -> list[Document]:
     """Load .xml files — extracts all text content from elements."""
-    import xml.etree.ElementTree as ET
+    try:
+        import defusedxml.ElementTree as ET
+    except ImportError:
+        logger.warning("defusedxml not installed; falling back to xml.etree (unsafe for untrusted XML)")
+        import xml.etree.ElementTree as ET
 
     docs: list[Document] = []
     for filename, file_bytes in iter_files_for_source(doc_source, extensions={".xml"}):
@@ -1350,7 +1434,7 @@ def load_logs(doc_source: str) -> list[Document]:
 # ─────────────────────────────────────────────────────────────────────
 
 
-def load_zip(doc_source: str) -> list[Document]:
+def load_zip(doc_source: str, _depth: int = 0) -> list[Document]:
     """Load .zip files by extracting contents and recursively loading.
 
     Safety guards: max nesting depth, max total bytes, max file count,
@@ -1359,9 +1443,8 @@ def load_zip(doc_source: str) -> list[Document]:
     import shutil
     import zipfile
 
-    global _zip_current_depth
-    if _zip_current_depth >= _ZIP_MAX_NESTING_DEPTH:
-        logger.warning("ZIP nesting depth %d exceeds limit %d — skipping", _zip_current_depth, _ZIP_MAX_NESTING_DEPTH)
+    if _depth >= _ZIP_MAX_NESTING_DEPTH:
+        logger.warning("ZIP nesting depth %d exceeds limit %d — skipping", _depth, _ZIP_MAX_NESTING_DEPTH)
         return []
 
     docs: list[Document] = []
@@ -1391,27 +1474,28 @@ def load_zip(doc_source: str) -> list[Document]:
                 zf.close()
                 continue
 
-            # Safety: check for path traversal
+            # Safety: check for path traversal using resolved paths
             bad_path = False
-            for name in zf.namelist():
-                if ".." in name or name.startswith("/") or name.startswith("\\"):
-                    logger.warning("ZIP %s contains suspicious path '%s' — skipping archive", filename, name)
+            tmp_dir = tempfile.mkdtemp(prefix="rag_zip_")
+            extract_root = Path(tmp_dir).resolve()
+            for entry in zf.infolist():
+                target = (extract_root / entry.filename).resolve()
+                if not str(target).startswith(str(extract_root)):
+                    logger.warning("ZIP %s contains path-traversal entry '%s' — skipping archive", filename, entry.filename)
                     bad_path = True
                     break
             if bad_path:
                 zf.close()
+                import shutil as _shutil
+                _shutil.rmtree(tmp_dir, ignore_errors=True)
+                tmp_dir = None
                 continue
 
-            tmp_dir = tempfile.mkdtemp(prefix="rag_zip_")
             zf.extractall(tmp_dir)
             zf.close()
 
             # Recursively load extracted files
-            _zip_current_depth += 1
-            try:
-                inner_docs = load_documents(tmp_dir)
-            finally:
-                _zip_current_depth -= 1
+            inner_docs = load_documents(tmp_dir, _zip_depth=_depth + 1)
 
             for doc in inner_docs:
                 doc.metadata["archive_source"] = filename
@@ -1590,7 +1674,7 @@ def load_purview_csv(doc_source: str) -> list[Document]:
 # ─────────────────────────────────────────────────────────────────────
 #  Master loader — dispatches to all format-specific loaders
 # ─────────────────────────────────────────────────────────────────────
-def load_documents(doc_source: str) -> list[Document]:
+def load_documents(doc_source: str, *, _zip_depth: int = 0) -> list[Document]:
     """Load all supported file types from a local directory or blob prefix.
 
     Supported: .txt, .pdf, .docx, .xlsx, .xls, .pptx, .md, .rtf, .doc,
@@ -1624,12 +1708,17 @@ def load_documents(doc_source: str) -> list[Document]:
         ("pst",    load_pst),
         ("purview-json", load_purview_json),
         ("purview-csv",  load_purview_csv),
-        ("zip",    load_zip),
     ]:
         loaded = loader(doc_source)
         if loaded:
             file_counts[label] = len(loaded)
             docs.extend(loaded)
+
+    # ZIP loader receives the current depth for thread-safe nesting control
+    zip_loaded = load_zip(doc_source, _depth=_zip_depth)
+    if zip_loaded:
+        file_counts["zip"] = len(zip_loaded)
+        docs.extend(zip_loaded)
 
     summary = " | ".join(f"{ext}: {cnt}" for ext, cnt in file_counts.items() if cnt)
     logger.info("Total documents loaded: %d  (%s)", len(docs), summary or "none")
@@ -1707,6 +1796,7 @@ def embed_chunks(chunks: list[Document], batch_size: int = 48, progress_cb=None)
             "effective_date", "message_id", "thread_id", "email_subject",
             "email_from", "email_to", "email_date", "chunk_type",
             "attachment_names", "parent_message_id", "total_chunks",
+            "body_only",
         }
         rows.append({
             "content": chunk.page_content, "embedding": emb,
@@ -1724,6 +1814,7 @@ def embed_chunks(chunks: list[Document], batch_size: int = 48, progress_cb=None)
             "attachment_names": meta.get("attachment_names") or meta.get("attachments", ""),
             "parent_message_id": meta.get("parent_message_id", ""),
             "total_chunks": meta.get("total_chunks"),
+            "body_only": meta.get("body_only"),
             "metadata_extra": {k: v for k, v in meta.items() if k not in _db_cols},
         })
     return rows
@@ -1773,10 +1864,24 @@ def ingest(
     # ── Load ─────────────────────────────────────────────────────
     _progress(0.05, "Loading documents...")
     report = IngestionReport()
+    _pst_metadata_rows.clear()  # reset before loading
     raw_docs = load_documents(doc_source)
     report.total_files_found = len(raw_docs)
     report.files_loaded = len(raw_docs)
     logger.info("[metrics] files_read=%d from source=%s", len(raw_docs), doc_source)
+
+    # ── Persist PST email metadata (feature-gated to demo-pst) ──
+    if case_id == "demo-pst" and _pst_metadata_rows:
+        meta_rows = list(_pst_metadata_rows)  # snapshot before clearing
+        _pst_metadata_rows.clear()
+        for row in meta_rows:
+            row["case_id"] = case_id
+        meta_count = upsert_pst_email_metadata(engine, meta_rows)
+        logger.info(
+            "[pst-metadata] Upserted %d email metadata rows for case '%s'",
+            meta_count, case_id,
+        )
+
     if not raw_docs:
         logger.warning("No documents loaded from %s — nothing to ingest.", doc_source)
         _progress(1.0, "No documents found")

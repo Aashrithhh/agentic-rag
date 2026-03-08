@@ -19,6 +19,7 @@ from typing import Any
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     Float,
@@ -28,6 +29,7 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    UniqueConstraint,
     create_engine,
     func,
     literal_column,
@@ -35,6 +37,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine
 
 from app.config import settings
@@ -61,17 +64,39 @@ document_chunks = Table(
     Column("email_subject", String(1024)),    # email subject line
     Column("email_from", String(512)),        # sender
     Column("email_to", String(1024)),         # recipients
-    Column("email_date", String(128)),        # email date string
+    Column("email_date", DateTime),        # email date (ISO-8601 normalized at ingestion)
     Column("chunk_type", String(64)),         # heading, paragraph, email_header, etc.
     Column("attachment_names", String(2048)), # comma-separated attachment filenames
     Column("parent_message_id", String(512)), # for attachment chunks → links to parent
     Column("total_chunks", Integer),          # total chunks from parent document
+    Column("body_only", Text),                   # pure email body without From/To/Date/Subject headers
     Column("metadata_extra", JSONB, server_default=text("'{}'")),
     Column(
         "ts_content",                         # tsvector for BM25-style keyword search
         TSVECTOR,
         nullable=True,
     ),
+)
+
+pst_email_metadata = Table(
+    "pst_email_metadata",
+    metadata_obj,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("case_id", String(128), nullable=False),
+    Column("PstFileId", String(512), nullable=False),
+    Column("Subject", String(1024)),
+    Column("SenderName", String(512)),
+    Column("SenderEmail", String(512)),
+    Column("RecipientTo", String(2048)),
+    Column("RecipientCc", String(2048)),
+    Column("SentDate", String(128)),
+    Column("BodyText", Text),
+    Column("BodyHtml", Text),
+    Column("HasAttachments", Boolean, nullable=False, server_default=text("false")),
+    Column("FolderPath", String(1024)),
+    Column("MessageId", String(512), nullable=False),
+    Column("ingested_at", DateTime, server_default=func.now(), nullable=False),
+    UniqueConstraint("case_id", "PstFileId", "MessageId", name="uq_pst_email_metadata_case_file_msg"),
 )
 
 # ── HNSW index for cosine similarity (high-recall, no training step) ─────
@@ -106,6 +131,38 @@ thread_id_index = Index(
 parent_msg_index = Index(
     "ix_chunks_parent_message_id",
     document_chunks.c.parent_message_id,
+)
+
+pst_meta_message_index = Index(
+    "ix_pst_email_metadata_message_id",
+    pst_email_metadata.c.MessageId,
+)
+
+# ── Saved flagged-document sets ──────────────────────────────────────────
+
+saved_flagged_docs = Table(
+    "saved_flagged_docs",
+    metadata_obj,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("case_id", String(128), nullable=False),
+    Column("filename", String(512), nullable=False),
+    Column("query_text", Text, nullable=False),
+    Column("saved_at", DateTime, server_default=func.now(), nullable=False),
+    Column("saved_by", String(256), nullable=True),
+    Column("docs_json", JSONB, nullable=False),
+    UniqueConstraint("case_id", "filename", name="uq_saved_flagged_docs_case_filename"),
+)
+
+ix_saved_flagged_case_savedat = Index(
+    "ix_saved_flagged_docs_case_saved_at",
+    saved_flagged_docs.c.case_id,
+    saved_flagged_docs.c.saved_at.desc(),
+)
+
+ix_saved_flagged_case_filename = Index(
+    "ix_saved_flagged_docs_case_filename",
+    saved_flagged_docs.c.case_id,
+    saved_flagged_docs.c.filename,
 )
 
 
@@ -242,7 +299,7 @@ def _ensure_email_columns(engine: Engine) -> None:
         ("email_subject", "VARCHAR(1024)"),
         ("email_from", "VARCHAR(512)"),
         ("email_to", "VARCHAR(1024)"),
-        ("email_date", "VARCHAR(128)"),
+        ("email_date", "TIMESTAMP"),
         ("chunk_type", "VARCHAR(64)"),
         ("attachment_names", "VARCHAR(2048)"),
         ("parent_message_id", "VARCHAR(512)"),
@@ -255,8 +312,10 @@ def _ensure_email_columns(engine: Engine) -> None:
                     f"ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS "
                     f"{col_name} {col_type}"
                 ))
-            except Exception:
-                pass  # Column already exists
+            except Exception as e:
+                logger.warning(
+                    "Could not add column '%s' (%s): %s", col_name, col_type, e
+                )
 
         # Create indexes if they don't exist
         for idx_name, col_name in [
@@ -268,8 +327,11 @@ def _ensure_email_columns(engine: Engine) -> None:
                 conn.execute(text(
                     f"CREATE INDEX IF NOT EXISTS {idx_name} ON document_chunks ({col_name})"
                 ))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    "Could not create index '%s' on column '%s': %s",
+                    idx_name, col_name, e,
+                )
 
 
 def upsert_chunks(
@@ -287,6 +349,46 @@ def upsert_chunks(
             inserted += len(batch)
     logger.info("Inserted %d chunks.", inserted)
     return inserted
+
+
+def upsert_pst_email_metadata(
+    engine: Engine,
+    rows: list[dict[str, Any]],
+    *,
+    batch_size: int = 256,
+) -> int:
+    """Upsert PST email metadata rows.
+
+    One row represents one email extracted from a PST source.
+    """
+    if not rows:
+        return 0
+
+    written = 0
+    with engine.begin() as conn:
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i : i + batch_size]
+            stmt = pg_insert(pst_email_metadata).values(batch)
+            stmt = stmt.on_conflict_do_update(
+                constraint="uq_pst_email_metadata_case_file_msg",
+                set_={
+                    "Subject": stmt.excluded.Subject,
+                    "SenderName": stmt.excluded.SenderName,
+                    "SenderEmail": stmt.excluded.SenderEmail,
+                    "RecipientTo": stmt.excluded.RecipientTo,
+                    "RecipientCc": stmt.excluded.RecipientCc,
+                    "SentDate": stmt.excluded.SentDate,
+                    "BodyText": stmt.excluded.BodyText,
+                    "BodyHtml": stmt.excluded.BodyHtml,
+                    "HasAttachments": stmt.excluded.HasAttachments,
+                    "FolderPath": stmt.excluded.FolderPath,
+                    "ingested_at": func.now(),
+                },
+            )
+            conn.execute(stmt)
+            written += len(batch)
+    logger.info("Upserted %d PST email metadata rows.", written)
+    return written
 
 
 def hybrid_search(
@@ -307,12 +409,20 @@ def hybrid_search(
     if metadata_filter:
         for col_name, value in metadata_filter.items():
             # Email-specific filters use ILIKE for partial matching
-            if col_name == "email_from":
-                where_clauses.append(document_chunks.c.email_from.ilike(f"%{value}%"))
-            elif col_name == "email_to":
-                where_clauses.append(document_chunks.c.email_to.ilike(f"%{value}%"))
-            elif col_name == "source_file":
-                where_clauses.append(document_chunks.c.source.ilike(f"%{value}%"))
+            if col_name in ("email_from", "email_to", "source_file"):
+                # Escape ILIKE wildcard characters in the value
+                escaped = (
+                    str(value)
+                    .replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_")
+                )
+                col = {
+                    "email_from": document_chunks.c.email_from,
+                    "email_to": document_chunks.c.email_to,
+                    "source_file": document_chunks.c.source,
+                }[col_name]
+                where_clauses.append(col.ilike(f"%{escaped}%", escape="\\"))
             elif col_name == "email_date_from":
                 where_clauses.append(document_chunks.c.email_date >= value)
             elif col_name == "email_date_to":
@@ -341,6 +451,7 @@ def hybrid_search(
         document_chunks.c.attachment_names,
         document_chunks.c.parent_message_id,
         document_chunks.c.total_chunks,
+        document_chunks.c.body_only,
         document_chunks.c.metadata_extra,
     ]
 
@@ -450,6 +561,47 @@ def fetch_neighbor_chunks(
     return [dict(row) for row in rows]
 
 
+def fetch_all_email_chunks(
+    engine: Engine,
+    message_id: str,
+) -> list[dict[str, Any]]:
+    """Fetch ALL chunks for a given message_id, ordered by chunk_index.
+
+    Used to assemble the complete email content for display.
+    """
+    if not message_id:
+        return []
+
+    q = (
+        select(
+            document_chunks.c.id,
+            document_chunks.c.content,
+            document_chunks.c.source,
+            document_chunks.c.page,
+            document_chunks.c.chunk_index,
+            document_chunks.c.doc_type,
+            document_chunks.c.entity_name,
+            document_chunks.c.message_id,
+            document_chunks.c.thread_id,
+            document_chunks.c.chunk_type,
+            document_chunks.c.email_subject,
+            document_chunks.c.email_from,
+            document_chunks.c.email_to,
+            document_chunks.c.email_date,
+            document_chunks.c.body_only,
+            document_chunks.c.total_chunks,
+            document_chunks.c.metadata_extra,
+        )
+        .where(document_chunks.c.message_id == message_id)
+        .order_by(document_chunks.c.chunk_index)
+    )
+
+    with engine.connect() as conn:
+        rows = conn.execute(q).mappings().all()
+
+    return [dict(row) for row in rows]
+
+
 def fetch_attachment_chunks(
     engine: Engine,
     message_id: str,
@@ -548,3 +700,80 @@ def fetch_parent_email_chunks(
         rows = conn.execute(q).mappings().all()
 
     return [dict(row) for row in rows]
+
+
+# ── Saved flagged-docs CRUD helpers ──────────────────────────────────────
+
+
+def save_flagged_doc_set(
+    engine: Engine,
+    *,
+    case_id: str,
+    filename: str,
+    query_text: str,
+    docs_json: list[dict[str, Any]],
+    saved_by: str | None = None,
+) -> int:
+    """Insert a saved flagged-doc set. Returns the new row id.
+
+    Raises ``sqlalchemy.exc.IntegrityError`` if the (case_id, filename)
+    pair already exists.
+    """
+    stmt = saved_flagged_docs.insert().values(
+        case_id=case_id,
+        filename=filename,
+        query_text=query_text,
+        docs_json=docs_json,
+        saved_by=saved_by,
+    ).returning(saved_flagged_docs.c.id)
+
+    with engine.begin() as conn:
+        row_id = conn.execute(stmt).scalar_one()
+    logger.info("Saved flagged doc set id=%d (case=%s, file=%s, docs=%d)",
+                row_id, case_id, filename, len(docs_json))
+    return row_id
+
+
+def list_flagged_doc_sets(
+    engine: Engine,
+    case_id: str,
+) -> list[dict[str, Any]]:
+    """List all saved flagged-doc sets for a case (newest first)."""
+    q = (
+        select(
+            saved_flagged_docs.c.id,
+            saved_flagged_docs.c.case_id,
+            saved_flagged_docs.c.filename,
+            saved_flagged_docs.c.query_text,
+            saved_flagged_docs.c.saved_at,
+            saved_flagged_docs.c.saved_by,
+            func.jsonb_array_length(saved_flagged_docs.c.docs_json).label("doc_count"),
+        )
+        .where(saved_flagged_docs.c.case_id == case_id)
+        .order_by(saved_flagged_docs.c.saved_at.desc())
+    )
+    with engine.connect() as conn:
+        rows = conn.execute(q).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def get_flagged_doc_set(
+    engine: Engine,
+    set_id: int,
+) -> dict[str, Any] | None:
+    """Fetch a single saved flagged-doc set by id."""
+    q = select(saved_flagged_docs).where(saved_flagged_docs.c.id == set_id)
+    with engine.connect() as conn:
+        row = conn.execute(q).mappings().first()
+    return dict(row) if row else None
+
+
+def delete_flagged_doc_set(
+    engine: Engine,
+    set_id: int,
+) -> bool:
+    """Delete a saved flagged-doc set by id. Returns True if a row was deleted."""
+    stmt = saved_flagged_docs.delete().where(saved_flagged_docs.c.id == set_id)
+    with engine.begin() as conn:
+        result = conn.execute(stmt)
+    return result.rowcount > 0

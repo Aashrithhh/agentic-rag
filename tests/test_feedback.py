@@ -271,7 +271,7 @@ class TestSaveChatEndpoint:
 
 
 class TestListChatsEndpoint:
-    def test_list_empty(self, client):
+    def test_list_empty(self, client, tmp_archive_dir):
         resp = client.get("/api/v1/chats/local", params={"case_id": "empty-case"})
         assert resp.status_code == 200
         data = resp.json()

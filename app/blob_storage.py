@@ -53,6 +53,12 @@ class BlobStorageClient:
         from azure.core.pipeline.transport import RequestsTransport
         from azure.storage.blob._shared.policies import StorageRetryPolicy
 
+        retry_policy = StorageRetryPolicy(
+            retry_total=MAX_DOWNLOAD_RETRIES,
+            retry_backoff_factor=RETRY_DELAY_SECONDS,
+            retry_mode="exponential",
+        )
+
         transport = RequestsTransport(
             connection_timeout=CONNECTION_TIMEOUT,
             read_timeout=READ_TIMEOUT,
@@ -65,6 +71,7 @@ class BlobStorageClient:
             self._container_client = ContainerClient.from_container_url(
                 settings.azure_storage_sas_url,
                 transport=transport,
+                retry_policy=retry_policy,
             )
             logger.info(
                 "Connected to Azure Blob Storage via SAS URL: %s",
@@ -77,6 +84,7 @@ class BlobStorageClient:
             service = BlobServiceClient.from_connection_string(
                 settings.azure_storage_connection_string,
                 transport=transport,
+                retry_policy=retry_policy,
             )
             self._container_client = service.get_container_client(
                 settings.azure_storage_container_name
@@ -126,7 +134,7 @@ class BlobStorageClient:
                     attempt, blob_name, str(e)[:200]
                 )
                 if attempt < MAX_DOWNLOAD_RETRIES:
-                    time.sleep(RETRY_DELAY_SECONDS * attempt)  # Exponential backoff
+                    time.sleep(RETRY_DELAY_SECONDS * (2 ** (attempt - 1)))  # Exponential backoff
         
         raise RuntimeError(
             f"Failed to download blob '{blob_name}' after {MAX_DOWNLOAD_RETRIES} attempts: {last_error}"

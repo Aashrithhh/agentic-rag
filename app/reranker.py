@@ -87,7 +87,7 @@ def rerank_with_llm(
     top_n = top_n or min(len(documents), settings.top_k)
 
     try:
-        from langchain_openai import ChatOpenAI
+        from app.llm import get_chat_llm
         from pydantic import BaseModel, Field
 
         class DocScore(BaseModel):
@@ -105,12 +105,7 @@ def rerank_with_llm(
             for i, d in enumerate(documents)
         )
 
-        llm = ChatOpenAI(
-            model=settings.openai_model,
-            api_key=settings.openai_api_key,
-            temperature=0,
-            max_tokens=2048,
-        )
+        llm = get_chat_llm(temperature=0, max_tokens=2048)
 
         structured_llm = llm.with_structured_output(RerankResult)
         result = structured_llm.invoke(

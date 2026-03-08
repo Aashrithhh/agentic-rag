@@ -16,11 +16,10 @@ import logging
 import time
 from typing import Any
 
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
-from app.config import settings
+from app.llm import get_chat_llm
 
 logger = logging.getLogger(__name__)
 
@@ -76,13 +75,8 @@ _prompt = ChatPromptTemplate.from_messages([
 # ── Core enrichment ─────────────────────────────────────────────────
 
 
-def _get_enrichment_llm() -> ChatOpenAI:
-    return ChatOpenAI(
-        model=settings.openai_model,
-        api_key=settings.openai_api_key,
-        temperature=0,
-        max_tokens=512,
-    )
+def _get_enrichment_llm():
+    return get_chat_llm(temperature=0, max_tokens=512)
 
 
 def enrich_chunk(chunk_text: str, source: str = "") -> ChunkEnrichment:

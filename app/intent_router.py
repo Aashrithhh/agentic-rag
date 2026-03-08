@@ -17,10 +17,10 @@ import logging
 from typing import Any, Literal
 
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from app.config import settings
+from app.llm import get_chat_llm
 
 logger = logging.getLogger(__name__)
 
@@ -140,12 +140,7 @@ def classify_intent(query: str) -> IntentClassification:
     metrics.inc("intent_classifications")
 
     try:
-        llm = ChatOpenAI(
-            model=settings.openai_model,
-            api_key=settings.openai_api_key,
-            temperature=0,
-            max_tokens=512,
-        )
+        llm = get_chat_llm(temperature=0, max_tokens=512)
         chain = _prompt | llm.with_structured_output(IntentClassification)
         result = chain.invoke({"query": query})
         logger.info(

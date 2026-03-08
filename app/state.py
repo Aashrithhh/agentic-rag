@@ -43,3 +43,8 @@ class AgentState(TypedDict, total=False):
 
     # ── Email-aware pipeline enrichment ─────────────────
     critical_fact_assessments: list[dict]             # from validator critical fact protection
+
+    # ── Hallucination guard ───────────────────────────────
+    hallucination_score: float                        # 0.0–1.0 risk score
+    hallucination_decision: str                       # "pass" | "warn" | "block"
+    hallucination_flags: list[dict]                   # concrete reason dicts

@@ -140,6 +140,20 @@ register(CaseConfig(
     ],
 ))
 
+# ─── Demo PST ─────────────────────────────────────────────────────
+register(CaseConfig(
+    case_id="demo-pst",
+    display_name="TechCorp Investigation",
+    doc_type="pst-email",
+    description="Demo PST — TechCorp internal investigation emails (2024)",
+    data_dir="data/demo_pst",
+    sample_questions=[
+        "What were the key findings in the TechCorp investigation?",
+        "Who were the main parties involved in the communications?",
+        "What compliance issues were discussed?",
+    ],
+))
+
 
 def get_case(case_id: str) -> CaseConfig:
     """Look up a case by ID. Raises KeyError if not found."""

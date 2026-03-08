@@ -5,12 +5,12 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
 from app.cache import cache, key_for
 from app.config import settings
+from app.llm import get_chat_llm
 from app.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -77,7 +77,7 @@ def _grader_node_inner(state: AgentState) -> dict:
         ck = key_for(
             "llm",
             {"node": "grader", "case_id": case_id, "query": query,
-             "docs": doc_snippets, "model": settings.openai_model},
+             "docs": doc_snippets, "model": settings.active_llm_model},
             prefix=f"grader:{case_id}",
         )
         hit, cached = cache.get("llm", ck)
@@ -85,12 +85,7 @@ def _grader_node_inner(state: AgentState) -> dict:
             logger.info("Grader cache HIT — score=%s", cached["grader_score"])
             return cached
 
-    llm = ChatOpenAI(
-        model=settings.openai_model,
-        api_key=settings.openai_api_key,
-        temperature=0,
-        max_tokens=1024,
-    )
+    llm = get_chat_llm(temperature=0, max_tokens=1024)
     structured_llm = llm.with_structured_output(GradeResult)
     chain = _prompt | structured_llm
     from app.resilience import invoke_with_retry
